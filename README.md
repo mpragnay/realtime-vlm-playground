@@ -281,7 +281,7 @@ Submit within **7 days**.
 2. **Technical report** (1 page) — architecture, frame sampling strategy, audio usage, model selection, cost breakdown, latency analysis. Bonus: bidirectional streaming redesign.
 3. **Demo video** (~3 min, optional) — your pipeline running on a clip.
 
-Push to your private repo, invite the evaluation team, email **elior@alcor-labs.com** with the repo link.
+Push to your private repo, invite the evaluation team (**gabe@alcor-labs.com** / **elior@alcor-labs.com**), and email the team with the repo link.
 
 ---
 
@@ -294,7 +294,7 @@ Push to your private repo, invite the evaluation team, email **elior@alcor-labs.
 - Run the evaluator and dashboard early to understand scoring
 - Monitor your spend on the [OpenRouter dashboard](https://openrouter.ai/activity)
 
-Questions? **elior@alcor-labs.com**
+Questions? **contact@alcor-labs.com**
 
 ---
 *Alcor Labs — March 2026*
