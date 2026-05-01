@@ -205,12 +205,61 @@ def evaluate(
     )
 
     if verbose:
-        print(_format_report(metrics, time_tolerance_sec))
+        print(_format_report(metrics, time_tolerance_sec, pred_steps, gt_steps))
 
     return metrics
 
 
-def _format_report(m: EvaluationMetrics, tol: float) -> str:
+def _closest_step_prediction(step_id: int, pred_steps: List[Dict]) -> Dict[str, Any] | None:
+    candidates = [p for p in pred_steps if p.get("step_id") == step_id]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda p: abs(p.get("timestamp_sec", 0)))
+
+
+def _step_timing_label(delta: float, tol: float, prediction: Dict[str, Any]) -> str:
+    is_catchup = "catch-up" in (prediction.get("description") or "").lower()
+    abs_delta = abs(delta)
+    if abs_delta <= tol:
+        return "matched"
+    if abs_delta <= tol + 1.0:
+        return "just outside tolerance"
+    if is_catchup and delta > tol:
+        return "late catch-up"
+    if is_catchup and delta < -tol:
+        return "early catch-up"
+    return "late" if delta > 0 else "early"
+
+
+def _format_step_timing_details(pred_steps: List[Dict], gt_steps: List[Dict], tol: float) -> List[str]:
+    if not gt_steps:
+        return []
+
+    lines = [
+        "",
+        "  STEP TIMING DETAILS",
+        "  " + "-" * 56,
+    ]
+    for gt in sorted(gt_steps, key=lambda e: e.get("step_id", 0)):
+        step_id = gt.get("step_id")
+        gt_ts = gt.get("timestamp_sec", 0)
+        pred = _closest_step_prediction(step_id, pred_steps)
+        if pred is None:
+            lines.append(f"    {step_id}:     n/a   missing prediction")
+            continue
+        pred_ts = pred.get("timestamp_sec", 0)
+        delta = pred_ts - gt_ts
+        label = _step_timing_label(delta, tol, pred)
+        lines.append(f"    {step_id}: {delta:+7.3f}s   {label}")
+    return lines
+
+
+def _format_report(
+    m: EvaluationMetrics,
+    tol: float,
+    pred_steps: List[Dict] | None = None,
+    gt_steps: List[Dict] | None = None,
+) -> str:
     lines = [
         "=" * 60,
         "  VLM ORCHESTRATOR — EVALUATION REPORT",
@@ -223,6 +272,10 @@ def _format_report(m: EvaluationMetrics, tol: float) -> str:
         f"    Recall:     {m.step_recall:.1%}",
         f"    F1:         {m.step_f1:.3f}",
         f"    {m.step_tp}/{m.total_gt_steps} matched, {m.step_fp} FP, {m.step_fn} FN",
+    ]
+    if pred_steps is not None and gt_steps is not None:
+        lines.extend(_format_step_timing_details(pred_steps, gt_steps, tol))
+    lines.extend([
         "",
         "  ERROR DETECTION",
         "  " + "-" * 56,
@@ -245,7 +298,7 @@ def _format_report(m: EvaluationMetrics, tol: float) -> str:
         f"    P90:    {m.p90_detection_delay_sec:.2f}s",
         f"    Max:    {m.max_detection_delay_sec:.2f}s",
         "=" * 60,
-    ]
+    ])
     return "\n".join(lines)
 
 

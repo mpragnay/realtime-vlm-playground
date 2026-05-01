@@ -23,6 +23,7 @@ from collections import deque
 
 import requests
 import numpy as np
+from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -203,7 +204,13 @@ class Pipeline:
     - How to generate spoken responses for errors
     """
 
-    def __init__(self, harness: StreamingHarness, api_key: str, procedure: Dict[str, Any]):
+    def __init__(
+        self,
+        harness: StreamingHarness,
+        api_key: str,
+        procedure: Dict[str, Any],
+        model: str = "google/gemini-2.5-flash",
+    ):
         self.harness = harness
         self.api_key = api_key
         self.procedure = procedure
@@ -211,7 +218,7 @@ class Pipeline:
         self.steps = procedure["steps"]
         self.step_by_id = {step["step_id"]: step for step in self.steps}
 
-        self.model = "google/gemini-2.5-flash"
+        self.model = model
         self.frame_buffer = deque(maxlen=20)
         self.frames_per_call = 6
         self.call_interval_sec = 3.0
@@ -606,6 +613,8 @@ If there are no step_completion or error_detected events, return {{"events": [],
 # ==========================================================================
 
 def main():
+    load_dotenv()
+
     parser = argparse.ArgumentParser(description="VLM Orchestrator Pipeline")
     parser.add_argument("--procedure", required=True, help="Path to procedure JSON")
     parser.add_argument("--video", required=True, help="Path to video MP4 (with audio)")
@@ -617,6 +626,8 @@ def main():
     parser.add_argument("--audio-chunk-sec", type=float, default=5.0,
                         help="Audio chunk duration in seconds (default: 5)")
     parser.add_argument("--api-key", help="OpenRouter API key (or set OPENROUTER_API_KEY)")
+    parser.add_argument("--model", default="google/gemini-2.5-flash",
+                        help="OpenRouter model string for VLM calls")
     parser.add_argument("--dry-run", action="store_true", help="Validate inputs only")
     args = parser.parse_args()
 
@@ -632,6 +643,7 @@ def main():
     print(f"  Procedure: {task_name} ({len(procedure['steps'])} steps)")
     print(f"  Video:     {args.video}")
     print(f"  Speed:     {args.speed}x")
+    print(f"  Model:     {args.model}")
     print()
 
     if args.dry_run:
@@ -660,7 +672,7 @@ def main():
         audio_chunk_sec=args.audio_chunk_sec,
     )
 
-    pipeline = Pipeline(harness, api_key, procedure)
+    pipeline = Pipeline(harness, api_key, procedure, model=args.model)
 
     # Register callbacks
     harness.on_frame(pipeline.on_frame)
