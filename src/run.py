@@ -20,6 +20,7 @@ import re
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from collections import deque
+import threading
 
 import requests
 import numpy as np
@@ -29,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.harness import StreamingHarness
 from src.data_loader import load_procedure_json, validate_procedure_format
+from src.visual_context import VisualContextManager
 
 
 # ==========================================================================
@@ -210,6 +212,9 @@ class Pipeline:
         api_key: str,
         procedure: Dict[str, Any],
         model: str = "google/gemini-2.5-flash",
+        vlm_log_path: Optional[str] = None,
+        vlm_log_start: Optional[float] = None,
+        vlm_log_end: Optional[float] = None,
     ):
         self.harness = harness
         self.api_key = api_key
@@ -220,16 +225,27 @@ class Pipeline:
 
         self.model = model
         self.frame_buffer = deque(maxlen=20)
-        self.frames_per_call = 6
-        self.call_interval_sec = 3.0
+        self.frames_per_call = 10
+        self.call_interval_sec = 5.0
         self.last_vlm_call_ts = -self.call_interval_sec
 
+        self.state_lock = threading.RLock()
         self.completed_steps = set()
         self.current_step_index = 0
+        self.visual_context = VisualContextManager(self.steps)
         self.emitted_error_times = []
         self.last_raw_vlm_response = ""
         self.last_status = {}
         self.api_calls = 0
+        self.vlm_log_path = Path(vlm_log_path) if vlm_log_path else None
+        self.vlm_log_start = vlm_log_start
+        self.vlm_log_end = vlm_log_end
+        self.vlm_log_count = 0
+        self.vlm_log_records = []
+        self.vlm_log_lock = threading.Lock()
+        if self.vlm_log_path:
+            self.vlm_log_path.parent.mkdir(parents=True, exist_ok=True)
+            self.vlm_log_path.write_text("[]" if self.vlm_log_path.suffix == ".json" else "")
 
         self.step_confidence_threshold = 0.60
         self.error_confidence_threshold = 0.55
@@ -258,20 +274,20 @@ class Pipeline:
                 "spoken_response": "Stop — you need to turn off the power first.",
             })
         """
-        self.frame_buffer.append({
-            "timestamp_sec": timestamp_sec,
-            "frame_base64": frame_base64,
-        })
+        with self.state_lock:
+            self.frame_buffer.append({
+                "timestamp_sec": timestamp_sec,
+                "frame_base64": frame_base64,
+            })
+            if (
+                len(self.frame_buffer) < self.frames_per_call
+                or timestamp_sec - self.last_vlm_call_ts < self.call_interval_sec
+            ):
+                return
+            selected_frames = list(self.frame_buffer)[-self.frames_per_call:]
+            self.last_vlm_call_ts = timestamp_sec
 
-        if len(self.frame_buffer) < self.frames_per_call:
-            return
-        if timestamp_sec - self.last_vlm_call_ts < self.call_interval_sec:
-            return
-
-        selected_frames = list(self.frame_buffer)[-self.frames_per_call:]
-        self.last_vlm_call_ts = timestamp_sec
-
-        prompt = self._build_prompt(selected_frames)
+        prompt = self._build_visual_prompt(selected_frames)
         try:
             response = call_vlm_multi_frame(
                 api_key=self.api_key,
@@ -282,15 +298,17 @@ class Pipeline:
             self.api_calls += 1
             self.last_raw_vlm_response = response
         except requests.RequestException as exc:
-            print(f"  [pipeline] VLM request failed at {timestamp_sec:.1f}s: {exc}")
+            print(f"  [pipeline] Visual VLM failed at {timestamp_sec:.1f}s: {exc}")
             return
 
         parsed = parse_json_response(response)
         if not parsed:
-            print(f"  [pipeline] Could not parse VLM JSON at {timestamp_sec:.1f}s")
+            self._maybe_log_vlm_call("visual_window", selected_frames, prompt, response, None)
+            print(f"  [pipeline] Could not parse visual VLM JSON at {timestamp_sec:.1f}s")
             return
 
-        self._handle_vlm_result(parsed, selected_frames, response)
+        self._maybe_log_vlm_call("visual_window", selected_frames, prompt, response, parsed)
+        self._handle_vlm_result(parsed, selected_frames, response, source="video")
 
     def on_audio(self, audio_bytes: bytes, start_sec: float, end_sec: float):
         """
@@ -301,116 +319,86 @@ class Pipeline:
             start_sec: Chunk start time in video
             end_sec: Chunk end time in video
 
-        TODO: Implement your audio processing logic.
-        Consider: speech-to-text, keyword detection, silence detection.
-        The instructor's verbal corrections are a strong signal for errors.
+        Audio is intentionally ignored in the visual-only baseline. The challenge
+        update says instructor audio can leak error labels, so STT experiments
+        live in audio_stt_experiment.py instead of this runtime pipeline.
         """
-        # Audio is intentionally left out of the first baseline. The callback is
-        # kept so the harness can deliver audio without affecting the pipeline.
         return
 
-    def _build_prompt(self, selected_frames: List[Dict[str, Any]]) -> str:
-        frame_lines = [
-            f"- image_{idx + 1}: timestamp_sec={frame['timestamp_sec']:.2f}"
-            for idx, frame in enumerate(selected_frames)
-        ]
-        completed = sorted(self.completed_steps)
-        current_step = self._current_step()
-        next_steps = self.steps[self.current_step_index:self.current_step_index + 2]
-        all_steps = "\n".join(
-            f"{step['step_id']}. {step['description']}" for step in self.steps
-        )
-        next_step_text = "\n".join(
-            f"{step['step_id']}. {step['description']}" for step in next_steps
-        )
+    def finish(self):
+        """No async work to finalize in the visual-only baseline."""
+        return
 
-        current_step_text = "None; all known procedure steps are complete."
-        if current_step:
-            current_step_text = f"{current_step['step_id']}. {current_step['description']}"
+    def _maybe_log_vlm_call(
+        self,
+        source: str,
+        selected_frames: List[Dict[str, Any]],
+        prompt: str,
+        response: str,
+        parsed: Optional[Dict[str, Any]],
+    ) -> None:
+        if not self.vlm_log_path or not selected_frames:
+            return
 
-        return f"""
-You are monitoring a real-time task video for step completions and mistakes.
+        frame_times = [frame["timestamp_sec"] for frame in selected_frames]
+        window_start = min(frame_times)
+        window_end = max(frame_times)
+        if self.vlm_log_start is not None and window_end < self.vlm_log_start:
+            return
+        if self.vlm_log_end is not None and window_start > self.vlm_log_end:
+            return
 
-Task: {self.task_name}
+        with self.state_lock:
+            current_step = self._current_step()
+            state = self.visual_context.state_snapshot(
+                completed_steps=sorted(self.completed_steps),
+                current_step_id=current_step.get("step_id") if current_step else None,
+            )
 
-Full procedure:
-{all_steps}
+        record = {
+            "source": source,
+            "frame_window": [window_start, window_end],
+            "frame_timestamps": frame_times,
+            "state_before_response": state,
+            "prompt": prompt,
+            "raw_response": response,
+            "parsed_response": parsed,
+        }
+        if isinstance(parsed, dict):
+            record["visual_context"] = self.visual_context.response_log_context(parsed)
+        with self.vlm_log_lock:
+            self.vlm_log_count += 1
+            record["log_index"] = self.vlm_log_count
+            if self.vlm_log_path.suffix == ".json":
+                self.vlm_log_records.append(record)
+                self.vlm_log_path.write_text(json.dumps(self.vlm_log_records, indent=2))
+            else:
+                with self.vlm_log_path.open("a") as f:
+                    f.write(json.dumps(record) + "\n")
 
-Known state before these images:
-- Completed step_ids: {completed}
-- Current expected step: {current_step_text}
-- Near-future steps to consider:
-{next_step_text}
-
-The attached images are current evidence frames in chronological order:
-{chr(10).join(frame_lines)}
-
-Detect only events visible in these current evidence frames.
-Most windows have no event. Do not invent an event just because a step is expected.
-
-Step completion rules:
-- A step_completion means the action for that step is finished by one of these frames.
-- Do not report a step_completion when the student has only started the action,
-  is holding the relevant object, or is still performing the action.
-- If the step appears to be underway but not clearly finished, return status
-  type step_in_progress instead of an event.
-- Prefer the latest frame timestamp where the completed final state is visible.
-- Only report uncompleted step_ids from the procedure.
-
-Error rules:
-- An error_detected means the student starts a wrong action, wrong sequence,
-  safety violation, or improper technique.
-- Prefer the earliest frame timestamp where the wrong action begins.
-- Do not report ordinary hesitation or normal progress as an error.
-- Be especially alert for the student grabbing, sliding, lifting, or using the
-  wrong toolbox, wrong part, wrong switch, wrong button, or doing steps out of
-  order compared with the current expected step.
-
-Return exactly one JSON object with this schema and no extra text:
-{{
-  "events": [
-    {{
-      "type": "step_completion",
-      "timestamp_sec": 12.5,
-      "step_id": 1,
-      "confidence": 0.0,
-      "description": "short reason"
-    }},
-    {{
-      "type": "error_detected",
-      "timestamp_sec": 14.0,
-      "confidence": 0.0,
-      "error_type": "wrong_action",
-      "severity": "warning",
-      "description": "short reason",
-      "spoken_response": "brief corrective instruction"
-    }}
-  ],
-  "status": {{
-    "type": "step_in_progress",
-    "step_id": 1,
-    "confidence": 0.0,
-    "description": "what appears to be happening if no event should be emitted"
-  }},
-  "summary": "brief observation of this window"
-}}
-
-Allowed event types: step_completion, error_detected.
-Allowed status type values: step_in_progress, no_action, uncertain, possible_error_not_enough_evidence, idle_or_waiting.
-Allowed error_type values: wrong_action, wrong_sequence, safety_violation, improper_technique, other.
-Allowed severity values: info, warning, critical.
-If there are no step_completion or error_detected events, return {{"events": [], "status": {{"type": "...", "description": "..."}}, "summary": "..."}}.
-""".strip()
+    def _build_visual_prompt(self, selected_frames: List[Dict[str, Any]]) -> str:
+        with self.state_lock:
+            completed = sorted(self.completed_steps)
+            current_step = self._current_step()
+            next_steps = self.steps[self.current_step_index:self.current_step_index + 1]
+            return self.visual_context.build_prompt(
+                task_name=self.task_name,
+                selected_frames=selected_frames,
+                completed_steps=completed,
+                current_step=current_step,
+                next_steps=next_steps,
+            )
 
     def _handle_vlm_result(
         self,
         parsed: Dict[str, Any],
         selected_frames: List[Dict[str, Any]],
         raw_response: str,
-    ) -> None:
+        source: str = "both",
+    ) -> List[Dict[str, Any]]:
         events = parsed.get("events", [])
         if not isinstance(events, list):
-            return
+            events = []
         status = parsed.get("status", {})
         if isinstance(status, dict):
             self.last_status = status
@@ -418,19 +406,20 @@ If there are no step_completion or error_detected events, return {{"events": [],
         frame_times = [frame["timestamp_sec"] for frame in selected_frames]
         min_ts = min(frame_times)
         max_ts = max(frame_times)
+        self._update_visual_context(parsed, frame_times)
 
         step_events = [
             event for event in events
             if isinstance(event, dict) and event.get("type") == "step_completion"
         ]
-        emitted_events = self._emit_ordered_steps(step_events, min_ts, max_ts, raw_response)
+        emitted_events = self._emit_ordered_steps(step_events, min_ts, max_ts, raw_response, source)
 
         for event in events:
             if not isinstance(event, dict):
                 continue
             event_type = event.get("type")
             if event_type == "error_detected":
-                emitted = self._maybe_emit_error(event, min_ts, max_ts, raw_response)
+                emitted = self._maybe_emit_error(event, min_ts, max_ts, raw_response, source=source)
                 if emitted:
                     emitted_events.append(emitted)
 
@@ -440,6 +429,11 @@ If there are no step_completion or error_detected events, return {{"events": [],
         ]
         if event_proposals:
             self._print_event_proposals(event_proposals, frame_times, emitted_events)
+        return emitted_events
+
+    def _update_visual_context(self, parsed: Dict[str, Any], frame_times: List[float]) -> None:
+        with self.state_lock:
+            self.visual_context.update_from_response(parsed, frame_times)
 
     def _emit_ordered_steps(
         self,
@@ -447,6 +441,7 @@ If there are no step_completion or error_detected events, return {{"events": [],
         min_ts: float,
         max_ts: float,
         raw_response: str,
+        source: str,
     ) -> List[Dict[str, Any]]:
         emitted_events = []
         events_by_step = {}
@@ -466,7 +461,7 @@ If there are no step_completion or error_detected events, return {{"events": [],
             event = events_by_step.get(expected_step_id)
             if event is None:
                 break
-            emitted = self._emit_step(event, min_ts, max_ts, raw_response)
+            emitted = self._emit_step(event, min_ts, max_ts, raw_response, source)
             if emitted:
                 emitted_events.append(emitted)
         return emitted_events
@@ -477,6 +472,7 @@ If there are no step_completion or error_detected events, return {{"events": [],
         min_ts: float,
         max_ts: float,
         raw_response: str,
+        source: str,
     ) -> Optional[Dict[str, Any]]:
         step_id = self._as_int(event.get("step_id"))
         if step_id is None:
@@ -487,7 +483,6 @@ If there are no step_completion or error_detected events, return {{"events": [],
 
         confidence = self._as_float(event.get("confidence"), default=0.0)
         timestamp_sec = self._bounded_timestamp(event.get("timestamp_sec"), min_ts, max_ts)
-        timestamp_sec = max(timestamp_sec, max_ts)
         step = self.step_by_id[step_id]
         emitted = {
             "timestamp_sec": timestamp_sec,
@@ -495,7 +490,7 @@ If there are no step_completion or error_detected events, return {{"events": [],
             "step_id": step_id,
             "confidence": confidence,
             "description": event.get("description") or step["description"],
-            "source": "video",
+            "source": source,
             "vlm_observation": raw_response[:1200],
         }
         self.harness.emit_event(emitted)
@@ -514,14 +509,17 @@ If there are no step_completion or error_detected events, return {{"events": [],
         min_ts: float,
         max_ts: float,
         raw_response: str,
+        source: str = "video",
     ) -> Optional[Dict[str, Any]]:
         confidence = self._as_float(event.get("confidence"), default=0.0)
         if confidence < self.error_confidence_threshold:
             return None
 
         timestamp_sec = self._bounded_timestamp(event.get("timestamp_sec"), min_ts, max_ts)
-        if any(abs(timestamp_sec - prior) < self.error_cooldown_sec for prior in self.emitted_error_times):
-            return None
+        with self.state_lock:
+            if any(abs(timestamp_sec - prior) < self.error_cooldown_sec for prior in self.emitted_error_times):
+                return None
+            self.emitted_error_times.append(timestamp_sec)
 
         error_type = event.get("error_type") or "other"
         if error_type not in self.harness.VALID_ERROR_TYPES:
@@ -538,11 +536,10 @@ If there are no step_completion or error_detected events, return {{"events": [],
             "severity": severity,
             "description": event.get("description") or "Possible procedure error detected.",
             "spoken_response": event.get("spoken_response") or "Stop and check the procedure before continuing.",
-            "source": "video",
+            "source": source,
             "vlm_observation": raw_response[:1200],
         }
         self.harness.emit_event(emitted)
-        self.emitted_error_times.append(timestamp_sec)
         return emitted
 
     def _print_event_proposals(
@@ -613,7 +610,7 @@ If there are no step_completion or error_detected events, return {{"events": [],
 # ==========================================================================
 
 def main():
-    load_dotenv()
+    load_dotenv(Path(__file__).parent.parent / ".env")
 
     parser = argparse.ArgumentParser(description="VLM Orchestrator Pipeline")
     parser.add_argument("--procedure", required=True, help="Path to procedure JSON")
@@ -628,6 +625,11 @@ def main():
     parser.add_argument("--api-key", help="OpenRouter API key (or set OPENROUTER_API_KEY)")
     parser.add_argument("--model", default="google/gemini-2.5-flash",
                         help="OpenRouter model string for VLM calls")
+    parser.add_argument("--vlm-log", help="Optional .json or .jsonl path for VLM prompt/response debug logs")
+    parser.add_argument("--vlm-log-start", type=float,
+                        help="Only log VLM calls whose frame window overlaps this timestamp")
+    parser.add_argument("--vlm-log-end", type=float,
+                        help="Only log VLM calls whose frame window overlaps this timestamp")
     parser.add_argument("--dry-run", action="store_true", help="Validate inputs only")
     args = parser.parse_args()
 
@@ -644,6 +646,7 @@ def main():
     print(f"  Video:     {args.video}")
     print(f"  Speed:     {args.speed}x")
     print(f"  Model:     {args.model}")
+    print("  Audio:     ignored (visual-only baseline)")
     print()
 
     if args.dry_run:
@@ -672,11 +675,20 @@ def main():
         audio_chunk_sec=args.audio_chunk_sec,
     )
 
-    pipeline = Pipeline(harness, api_key, procedure, model=args.model)
+    pipeline = Pipeline(
+        harness,
+        api_key,
+        procedure,
+        model=args.model,
+        vlm_log_path=args.vlm_log,
+        vlm_log_start=args.vlm_log_start,
+        vlm_log_end=args.vlm_log_end,
+    )
 
     # Register callbacks
     harness.on_frame(pipeline.on_frame)
     harness.on_audio(pipeline.on_audio)
+    harness.on_complete(pipeline.finish)
 
     # Run
     results = harness.run()

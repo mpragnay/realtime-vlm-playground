@@ -114,6 +114,7 @@ class StreamingHarness:
 
         self._frame_callbacks: List[Callable] = []
         self._audio_callbacks: List[Callable] = []
+        self._complete_callbacks: List[Callable] = []
         self._emitted_events: List[EmittedEvent] = []
         self._start_wall_time: float = 0
         self._current_video_time: float = 0
@@ -145,6 +146,10 @@ class StreamingHarness:
             end_sec: chunk end timestamp in the video
         """
         self._audio_callbacks.append(callback)
+
+    def on_complete(self, callback: Callable[[], None]):
+        """Register a callback to run after streaming finishes, before results are built."""
+        self._complete_callbacks.append(callback)
 
     VALID_EVENT_TYPES = {"step_completion", "error_detected", "idle_detected"}
     VALID_SOURCES = {"video", "audio", "both"}
@@ -386,6 +391,12 @@ class StreamingHarness:
         # Final update
         with self._lock:
             self._current_video_time = video_duration
+
+        for cb in self._complete_callbacks:
+            try:
+                cb()
+            except Exception as e:
+                print(f"  [harness] Completion callback error: {e}")
 
         wall_duration = time.monotonic() - self._start_wall_time
         end_dt = datetime.utcnow().isoformat() + "Z"
