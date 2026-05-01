@@ -1,0 +1,114 @@
+{
+  "video": "R066-15July-Circuit-Breaker-part2",
+  "chunk_sec": 5.0,
+  "notes": "Expected chunk transcripts for STT experiments, ported from the user's 0-80s log. Where a correction was provided, expected_text uses the corrected segment. These are for audio debugging only and should not be used as benchmark prompt context.",
+  "chunks": [
+    {
+      "start_sec": 0.0,
+      "end_sec": 5.0,
+      "expected_text": "Please wait looking for server heartbeat.",
+      "expected_phrases": ["please wait", "server heartbeat"]
+    },
+    {
+      "start_sec": 5.0,
+      "end_sec": 10.0,
+      "expected_text": "Go to the red toolbox and open the top drawer.",
+      "expected_phrases": ["red toolbox", "open the top drawer"]
+    },
+    {
+      "start_sec": 10.0,
+      "end_sec": 15.0,
+      "expected_text": "Oh, to the right.",
+      "expected_phrases": ["to the right"]
+    },
+    {
+      "start_sec": 15.0,
+      "end_sec": 20.0,
+      "expected_text": "Stand up.",
+      "expected_phrases": ["stand up"]
+    },
+    {
+      "start_sec": 20.0,
+      "end_sec": 25.0,
+      "expected_text": "Leave the toolbox.",
+      "expected_phrases": ["leave the toolbox"],
+      "forbidden_phrases": ["weedle toolbox", "weber toolbox"],
+      "notes": "Corrected from STT hallucination."
+    },
+    {
+      "start_sec": 25.0,
+      "end_sec": 30.0,
+      "expected_text": "Go to the right.",
+      "expected_phrases": ["go to the right"]
+    },
+    {
+      "start_sec": 30.0,
+      "end_sec": 35.0,
+      "expected_text": "Okay.",
+      "expected_phrases": ["okay"]
+    },
+    {
+      "start_sec": 35.0,
+      "end_sec": 40.0,
+      "expected_text": "The top part.",
+      "expected_phrases": ["top part"],
+      "forbidden_phrases": ["wind blew", "hungry"],
+      "notes": "Corrected from unclear audio; user noted something similar to 'the top part'."
+    },
+    {
+      "start_sec": 40.0,
+      "end_sec": 45.0,
+      "expected_text": "Square space.",
+      "expected_phrases": ["square space"],
+      "notes": "No correction provided; ported from logged STT."
+    },
+    {
+      "start_sec": 45.0,
+      "end_sec": 50.0,
+      "expected_text": "Plug the new component into the socket.",
+      "expected_phrases": ["plug the new component", "socket"]
+    },
+    {
+      "start_sec": 50.0,
+      "end_sec": 55.0,
+      "expected_text": "",
+      "notes": "No speech in log."
+    },
+    {
+      "start_sec": 55.0,
+      "end_sec": 60.0,
+      "expected_text": "",
+      "notes": "No speech in log."
+    },
+    {
+      "start_sec": 60.0,
+      "end_sec": 65.0,
+      "expected_text": "And close the panel, and the circuit breaker.",
+      "expected_phrases": ["close the panel", "circuit breaker"],
+      "notes": "Corrected from user note; exact second clause was partly unclear."
+    },
+    {
+      "start_sec": 65.0,
+      "end_sec": 70.0,
+      "expected_text": "Switch the main power on.",
+      "expected_phrases": ["switch the main power on"],
+      "forbidden_phrases": ["switch to me"],
+      "notes": "Corrected from STT hallucination."
+    },
+    {
+      "start_sec": 70.0,
+      "end_sec": 75.0,
+      "expected_text": "",
+      "forbidden_phrases": ["hello"],
+      "notes": "No audio; equipment noise only."
+    },
+    {
+      "start_sec": 75.0,
+      "end_sec": 80.0,
+      "expected_text": "Now press the reset button on the left side of the circuit box.",
+      "expected_phrases": ["press the reset button", "left side", "circuit box"],
+      "forbidden_phrases": ["attach the reset pin"],
+      "notes": "Corrected from STT hallucination."
+    }
+  ]
+}
