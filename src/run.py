@@ -23,6 +23,7 @@ from collections import deque
 
 import requests
 import numpy as np
+from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -203,7 +204,13 @@ class Pipeline:
     - How to generate spoken responses for errors
     """
 
-    def __init__(self, harness: StreamingHarness, api_key: str, procedure: Dict[str, Any]):
+    def __init__(
+        self,
+        harness: StreamingHarness,
+        api_key: str,
+        procedure: Dict[str, Any],
+        model: str = "google/gemini-2.5-flash",
+    ):
         self.harness = harness
         self.api_key = api_key
         self.procedure = procedure
@@ -211,20 +218,23 @@ class Pipeline:
         self.steps = procedure["steps"]
         self.step_by_id = {step["step_id"]: step for step in self.steps}
 
-        self.model = "google/gemini-2.5-flash"
+        self.model = model
         self.frame_buffer = deque(maxlen=20)
         self.frames_per_call = 6
         self.call_interval_sec = 3.0
         self.last_vlm_call_ts = -self.call_interval_sec
+        self.last_vlm_window_end = None
 
         self.completed_steps = set()
         self.current_step_index = 0
         self.emitted_error_times = []
         self.last_raw_vlm_response = ""
         self.last_status = {}
+        self.last_window_summary = ""
         self.api_calls = 0
 
         self.step_confidence_threshold = 0.60
+        self.catchup_confidence_threshold = 0.85
         self.error_confidence_threshold = 0.55
         self.error_cooldown_sec = 2.0
 
@@ -334,12 +344,18 @@ Known state before these images:
 - Current expected step: {current_step_text}
 - Near-future steps to consider:
 {next_step_text}
+- Previous VLM status: {json.dumps(self.last_status)}
+- Previous VLM summary: {self.last_window_summary or "None"}
 
-The attached images are current evidence frames in chronological order:
+The attached current evidence images are in chronological order:
 {chr(10).join(frame_lines)}
 
-Detect only events visible in these current evidence frames.
+Detect only events visible in the current evidence images image_1 through image_{len(selected_frames)}.
+Use previous VLM text only to understand continuity from the prior call.
+Do not emit a new event from the previous VLM text.
 Most windows have no event. Do not invent an event just because a step is expected.
+If the current evidence is ambiguous, return no events and use status instead.
+It is better to defer a step completion to a later call than emit it early.
 
 Step completion rules:
 - A step_completion means the action for that step is finished by one of these frames.
@@ -383,13 +399,17 @@ Return exactly one JSON object with this schema and no extra text:
     "type": "step_in_progress",
     "step_id": 1,
     "confidence": 0.0,
-    "description": "what appears to be happening if no event should be emitted"
+    "description": "what appears to be happening if no event should be emitted",
+    "last_frame_state": "what is visible in the latest current evidence image",
+    "completion_evidence": "why the current expected step is or is not complete",
+    "event_recommendation": "defer"
   }},
   "summary": "brief observation of this window"
 }}
 
 Allowed event types: step_completion, error_detected.
 Allowed status type values: step_in_progress, no_action, uncertain, possible_error_not_enough_evidence, idle_or_waiting.
+Allowed event_recommendation values: defer, emit_if_still_complete, watch_for_error, no_event.
 Allowed error_type values: wrong_action, wrong_sequence, safety_violation, improper_technique, other.
 Allowed severity values: info, warning, critical.
 If there are no step_completion or error_detected events, return {{"events": [], "status": {{"type": "...", "description": "..."}}, "summary": "..."}}.
@@ -407,6 +427,9 @@ If there are no step_completion or error_detected events, return {{"events": [],
         status = parsed.get("status", {})
         if isinstance(status, dict):
             self.last_status = status
+        summary = parsed.get("summary", "")
+        if isinstance(summary, str):
+            self.last_window_summary = summary[:500]
 
         frame_times = [frame["timestamp_sec"] for frame in selected_frames]
         min_ts = min(frame_times)
@@ -433,6 +456,7 @@ If there are no step_completion or error_detected events, return {{"events": [],
         ]
         if event_proposals:
             self._print_event_proposals(event_proposals, frame_times, emitted_events)
+        self.last_vlm_window_end = max_ts
 
     def _emit_ordered_steps(
         self,
@@ -458,11 +482,64 @@ If there are no step_completion or error_detected events, return {{"events": [],
             expected_step_id = self.steps[self.current_step_index]["step_id"]
             event = events_by_step.get(expected_step_id)
             if event is None:
-                break
+                catchup = self._maybe_emit_catchup_step(events_by_step, min_ts, max_ts, raw_response)
+                if not catchup:
+                    break
+                emitted_events.extend(catchup)
+                continue
             emitted = self._emit_step(event, min_ts, max_ts, raw_response)
             if emitted:
                 emitted_events.append(emitted)
+                continue
+            break
         return emitted_events
+
+    def _maybe_emit_catchup_step(
+        self,
+        events_by_step: Dict[int, Dict[str, Any]],
+        min_ts: float,
+        max_ts: float,
+        raw_response: str,
+    ) -> List[Dict[str, Any]]:
+        if self.current_step_index + 1 >= len(self.steps):
+            return []
+
+        current_step = self.steps[self.current_step_index]
+        next_step = self.steps[self.current_step_index + 1]
+        next_event = events_by_step.get(next_step["step_id"])
+        if next_event is None:
+            return []
+
+        confidence = self._as_float(next_event.get("confidence"), default=0.0)
+        if confidence < self.catchup_confidence_threshold:
+            return []
+
+        catchup_timestamp = self.last_vlm_window_end
+        if catchup_timestamp is None:
+            catchup_timestamp = min_ts
+        catchup_timestamp = min(catchup_timestamp, max_ts)
+
+        catchup_event = {
+            "timestamp_sec": catchup_timestamp,
+            "type": "step_completion",
+            "step_id": current_step["step_id"],
+            "confidence": min(confidence, 0.75),
+            "description": (
+                "State catch-up: the VLM detected the next step, so the prior "
+                f"expected step is treated as completed: {current_step['description']}"
+            ),
+            "source": "video",
+            "vlm_observation": raw_response[:1200],
+        }
+        self.harness.emit_event(catchup_event)
+        self.completed_steps.add(current_step["step_id"])
+        self.current_step_index += 1
+
+        emitted_next = self._emit_step(next_event, min_ts, max_ts, raw_response)
+        emitted = [catchup_event]
+        if emitted_next:
+            emitted.append(emitted_next)
+        return emitted
 
     def _emit_step(
         self,
@@ -606,6 +683,8 @@ If there are no step_completion or error_detected events, return {{"events": [],
 # ==========================================================================
 
 def main():
+    load_dotenv()
+
     parser = argparse.ArgumentParser(description="VLM Orchestrator Pipeline")
     parser.add_argument("--procedure", required=True, help="Path to procedure JSON")
     parser.add_argument("--video", required=True, help="Path to video MP4 (with audio)")
@@ -617,6 +696,8 @@ def main():
     parser.add_argument("--audio-chunk-sec", type=float, default=5.0,
                         help="Audio chunk duration in seconds (default: 5)")
     parser.add_argument("--api-key", help="OpenRouter API key (or set OPENROUTER_API_KEY)")
+    parser.add_argument("--model", default="google/gemini-2.5-flash",
+                        help="OpenRouter model string for VLM calls")
     parser.add_argument("--dry-run", action="store_true", help="Validate inputs only")
     args = parser.parse_args()
 
@@ -632,6 +713,7 @@ def main():
     print(f"  Procedure: {task_name} ({len(procedure['steps'])} steps)")
     print(f"  Video:     {args.video}")
     print(f"  Speed:     {args.speed}x")
+    print(f"  Model:     {args.model}")
     print()
 
     if args.dry_run:
@@ -660,7 +742,7 @@ def main():
         audio_chunk_sec=args.audio_chunk_sec,
     )
 
-    pipeline = Pipeline(harness, api_key, procedure)
+    pipeline = Pipeline(harness, api_key, procedure, model=args.model)
 
     # Register callbacks
     harness.on_frame(pipeline.on_frame)
