@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.harness import StreamingHarness
 from src.data_loader import load_procedure_json, validate_procedure_format
 from src.visual_context import VisualContextManager
+from src.step_rubric import resolve_step_rubrics
 
 
 # ==========================================================================
@@ -212,6 +213,8 @@ class Pipeline:
         api_key: str,
         procedure: Dict[str, Any],
         model: str = "google/gemini-2.5-flash",
+        step_rubrics: Optional[List[Dict[str, Any]]] = None,
+        step_rubric_mode: str = "soft",
         vlm_log_path: Optional[str] = None,
         vlm_log_start: Optional[float] = None,
         vlm_log_end: Optional[float] = None,
@@ -232,7 +235,11 @@ class Pipeline:
         self.state_lock = threading.RLock()
         self.completed_steps = set()
         self.current_step_index = 0
-        self.visual_context = VisualContextManager(self.steps)
+        self.visual_context = VisualContextManager(
+            self.steps,
+            step_rubrics=step_rubrics,
+            step_rubric_mode=step_rubric_mode,
+        )
         self.emitted_error_times = []
         self.last_raw_vlm_response = ""
         self.last_status = {}
@@ -380,7 +387,7 @@ class Pipeline:
         with self.state_lock:
             completed = sorted(self.completed_steps)
             current_step = self._current_step()
-            next_steps = self.steps[self.current_step_index:self.current_step_index + 1]
+            next_steps = self.steps[self.current_step_index + 1:self.current_step_index + 2]
             return self.visual_context.build_prompt(
                 task_name=self.task_name,
                 selected_frames=selected_frames,
@@ -625,6 +632,18 @@ def main():
     parser.add_argument("--api-key", help="OpenRouter API key (or set OPENROUTER_API_KEY)")
     parser.add_argument("--model", default="google/gemini-2.5-flash",
                         help="OpenRouter model string for VLM calls")
+    parser.add_argument("--step-rubric",
+                        help="Load an existing procedure-only step rubric JSON")
+    parser.add_argument("--step-rubric-output",
+                        help="Path to write/read generated step rubric JSON")
+    parser.add_argument("--no-step-rubric", action="store_true",
+                        help="Disable procedure-only step rubrics for this run")
+    parser.add_argument("--step-rubric-mode", choices=["soft", "strict"], default="soft",
+                        help="How strongly runtime prompt treats step rubrics")
+    parser.add_argument("--regenerate-step-rubric", action="store_true",
+                        help="Ignore cached step rubric and regenerate it")
+    parser.add_argument("--rubric-model",
+                        help="OpenRouter model string for rubric generation (defaults to --model)")
     parser.add_argument("--vlm-log", help="Optional .json or .jsonl path for VLM prompt/response debug logs")
     parser.add_argument("--vlm-log-start", type=float,
                         help="Only log VLM calls whose frame window overlaps this timestamp")
@@ -649,6 +668,31 @@ def main():
     print("  Audio:     ignored (visual-only baseline)")
     print()
 
+    api_key = args.api_key or os.getenv("OPENROUTER_API_KEY")
+    rubric_model = args.rubric_model or args.model
+    step_rubrics = []
+    if args.no_step_rubric:
+        print("  Step rubrics: disabled")
+    else:
+        try:
+            step_rubrics, rubric_path, rubric_source = resolve_step_rubrics(
+                api_key=api_key,
+                procedure=procedure,
+                procedure_path=args.procedure,
+                explicit_path=args.step_rubric,
+                output_path=args.step_rubric_output,
+                regenerate=args.regenerate_step_rubric,
+                model=rubric_model,
+            )
+            print(
+                f"  Step rubrics: {rubric_source} "
+                f"({len(step_rubrics)} steps) -> {rubric_path}"
+            )
+            print(f"  Step rubric mode: {args.step_rubric_mode}")
+        except (ValueError, requests.RequestException, OSError, json.JSONDecodeError) as exc:
+            print(f"  WARNING: Step rubrics unavailable, falling back to base prompt: {exc}")
+    print()
+
     if args.dry_run:
         if not Path(args.video).exists():
             print(f"  WARNING: Video not found: {args.video}")
@@ -661,7 +705,6 @@ def main():
         print(f"  ERROR: Video not found: {args.video}")
         sys.exit(1)
 
-    api_key = args.api_key or os.getenv("OPENROUTER_API_KEY")
     if not api_key:
         print("  ERROR: Set OPENROUTER_API_KEY or pass --api-key")
         sys.exit(1)
@@ -680,6 +723,8 @@ def main():
         api_key,
         procedure,
         model=args.model,
+        step_rubrics=step_rubrics,
+        step_rubric_mode=args.step_rubric_mode,
         vlm_log_path=args.vlm_log,
         vlm_log_start=args.vlm_log_start,
         vlm_log_end=args.vlm_log_end,

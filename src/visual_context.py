@@ -1,12 +1,24 @@
+import json
 from typing import Any, Dict, List, Optional, Tuple
 
 
 class VisualContextManager:
     """Builds visual prompts and maintains VLM-produced visual memory."""
 
-    def __init__(self, steps: List[Dict[str, Any]]):
+    def __init__(
+        self,
+        steps: List[Dict[str, Any]],
+        step_rubrics: Optional[List[Dict[str, Any]]] = None,
+        step_rubric_mode: str = "soft",
+    ):
         self.steps = steps
         self.step_by_id = {step["step_id"]: step for step in steps}
+        self.step_rubric_mode = step_rubric_mode
+        self.step_rubrics = {
+            int(rubric["step_id"]): rubric
+            for rubric in step_rubrics or []
+            if isinstance(rubric, dict) and "step_id" in rubric
+        }
         self.step_context = {step["step_id"]: "" for step in steps}
         self.window_descriptions: List[Dict[str, Any]] = []
         self.window_context_history: List[Dict[str, Any]] = []
@@ -32,6 +44,7 @@ class VisualContextManager:
         current_step_text = "None; all known procedure steps are complete."
         if current_step:
             current_step_text = f"{current_step['step_id']}. {current_step['description']}"
+        input_rubric_guidance, step_rubric_guidance = self.rubric_prompt_guidance()
 
         return f"""
 You are monitoring a procedural task video using visual evidence only.
@@ -57,6 +70,9 @@ Procedure state:
 - Next step to consider:
 {next_step_text}
 
+Procedure-only visual completion rubrics:
+{self.format_step_rubrics(current_step, next_steps)}
+
 Tentative step-wise visual context from previous calls:
 {self.format_step_context()}
 
@@ -69,8 +85,7 @@ Current frames in chronological order:
 How to use the inputs:
 - Use only the attached frames.
 - These frames are a short rolling window. Most windows have no event.
-- The current expected step tells you what completion to look for, but do not
-  invent completion just because it is expected.
+{input_rubric_guidance}
 - Most windows have no event.
 - Use prior visual context as a tentative timeline of what appeared to happen
   before this window. In the current window, describe how that timeline
@@ -110,6 +125,7 @@ Step completion rules:
 - Do not report completion when the technician has only started the action, or is still performing the action.
 - Prefer the frame timestamp where the completed final state first becomes
   clearly visible.
+{step_rubric_guidance}
 
 How to use visual context for step detection:
 - Visual context helps you understand continuity: where the student came from,
@@ -231,6 +247,30 @@ Allowed severity values: info, warning, critical.
 If there are no events, return {{"events": [], "status": {{"type": "...", "description": "..."}}, "summary": "..."}}.
 """.strip()
 
+    def rubric_prompt_guidance(self) -> Tuple[str, str]:
+        if self.step_rubric_mode == "strict":
+            return (
+                "- The current step rubric is the authority for what visual evidence completes\n"
+                "  the expected step. Do not invent completion just because a step is expected.",
+                "- Before emitting step_completion, explicitly use the current step rubric:\n"
+                "  identify the required final visual state, compare it against the current\n"
+                "  frames, and emit only if at least one completion_visual_state is visibly true.\n"
+                "- If the step is not complete, status.description must say which required visual\n"
+                "  evidence from the rubric is missing or still ambiguous.",
+            )
+        return (
+            "- Use the current step rubric as guidance for what visual evidence may complete\n"
+            "  the expected step. The rubric is not exhaustive: equivalent visible evidence\n"
+            "  can also count if it clearly satisfies the procedure step. Do not invent\n"
+            "  completion just because a step is expected.",
+            "- For emitting step_completion, use the current step rubric as guidance:\n"
+            "  identify the likely required final visual state, compare it against the\n"
+            "  current frames, and emit if the frames show that state or an equivalent\n"
+            "  visual state that clearly completes the step.\n"
+            "- If the step is not complete, status.description must say which expected\n"
+            "  visual evidence is missing or still ambiguous.",
+        )
+
     def state_snapshot(
         self,
         completed_steps: List[int],
@@ -258,6 +298,32 @@ If there are no events, return {{"events": [], "status": {{"type": "...", "descr
             "summary": parsed.get("summary"),
             "events": parsed.get("events", []),
         }
+
+    def format_step_rubrics(
+        self,
+        current_step: Optional[Dict[str, Any]],
+        next_steps: List[Dict[str, Any]],
+    ) -> str:
+        if not self.step_rubrics:
+            return "- No procedure-only visual completion rubrics available."
+
+        rubrics = []
+        seen = set()
+        for step in [current_step] + list(next_steps):
+            if not step:
+                continue
+            step_id = int(step["step_id"])
+            if step_id in seen:
+                continue
+            seen.add(step_id)
+            rubric = self.step_rubrics.get(step_id)
+            if rubric:
+                rubrics.append(rubric)
+
+        if not rubrics:
+            return "- No rubric is available for the current/next step."
+
+        return json.dumps(rubrics, indent=2)
 
     def update_from_response(
         self,
