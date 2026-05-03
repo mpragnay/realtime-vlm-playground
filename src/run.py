@@ -1,198 +1,55 @@
 """
-VLM Orchestrator — Starter Template
+Descriptor/reasoner routing submission pipeline.
 
-This is where you implement your pipeline. The harness feeds you frames
-and audio in real-time. You call VLMs, detect events, and emit them back.
+The harness feeds frames in real time. This file buffers those frames into
+5-second descriptor windows, calls the image descriptor model, then sends every
+two descriptor windows to the text-only reasoner. Descriptor and detector logic
+live in separate modules:
+
+  - src.descriptor_experiment: image-window description prompt/API helpers
+  - src.routing_experiment: text-only event detector/reasoner
 
 Usage:
-    python src/run.py \\
-        --procedure data/clip_procedures/CLIP.json \\
-        --video path/to/Video_pitchshift.mp4 \\
-        --output output/events.json \\
+    python src/integrated_pipeline.py \
+        --procedure data/clip_procedures/CLIP.json \
+        --video path/to/Video_pitchshift.mp4 \
+        --output output/events.json \
         --speed 1.0
 """
 
+from __future__ import annotations
+
+import argparse
 import json
 import os
 import sys
-import argparse
-import re
 from pathlib import Path
-from typing import Dict, Any, List, Optional
-from collections import deque
-import threading
+from typing import Any, Dict, List, Optional
 
-import requests
 import numpy as np
 from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.harness import StreamingHarness
 from src.data_loader import load_procedure_json, validate_procedure_format
-from src.visual_context import VisualContextManager
-from src.step_rubric import resolve_step_rubrics
+from src.descriptor import (
+    build_descriptor_prompt,
+    call_openrouter_descriptor,
+    frame_to_base64,
+    normalize_window_description,
+    parse_json_response,
+)
+from src.harness import StreamingHarness
+from src.routing import RoutingReasoner, make_window_groups
+from src.smart_frame_sampler import smart_select_frames
+from src.step_rubric import load_step_rubrics
 
 
-# ==========================================================================
-# VLM API HELPER (provided — feel free to modify)
-# ==========================================================================
-
-def call_vlm(
-    api_key: str,
-    frame_base64: str,
-    prompt: str,
-    model: str = "google/gemini-2.5-flash",
-    stream: bool = False,
-) -> str:
-    """
-    Call a VLM via OpenRouter.
-
-    Args:
-        api_key: OpenRouter API key
-        frame_base64: Base64-encoded JPEG frame
-        prompt: Text prompt
-        model: OpenRouter model string
-        stream: If True, use streaming (SSE) responses for lower time-to-first-token
-
-    Returns:
-        Model response text
-    """
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "HTTP-Referer": "https://github.com/alcor-labs/vlm-orchestrator-eval",
-        "X-Title": "VLM Orchestrator Evaluation",
-    }
-    payload = {
-        "model": model,
-        "stream": stream,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{frame_base64}"},
-                    },
-                ],
-            }
-        ],
-    }
-
-    if stream:
-        # Streaming: read SSE chunks as they arrive
-        resp = requests.post(url, json=payload, headers=headers, stream=True, timeout=30)
-        resp.raise_for_status()
-        full_text = ""
-        for line in resp.iter_lines():
-            if not line:
-                continue
-            line = line.decode("utf-8")
-            if line.startswith("data: "):
-                data = line[6:]
-                if data == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data)
-                    delta = chunk["choices"][0].get("delta", {})
-                    if "content" in delta:
-                        full_text += delta["content"]
-                except (json.JSONDecodeError, KeyError):
-                    pass
-        return full_text
-    else:
-        resp = requests.post(url, json=payload, headers=headers, timeout=30)
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
-
-
-def call_vlm_multi_frame(
-    api_key: str,
-    frames_base64: List[str],
-    prompt: str,
-    model: str = "google/gemini-2.5-flash",
-    stream: bool = False,
-    temperature: Optional[float] = None,
-    top_p: Optional[float] = None,
-) -> str:
-    """
-    Call a VLM with multiple timestamped frame images.
-
-    The prompt is responsible for describing which image corresponds to which
-    timestamp. Images are attached in the same order as frames_base64.
-    """
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "HTTP-Referer": "https://github.com/alcor-labs/vlm-orchestrator-eval",
-        "X-Title": "VLM Orchestrator Evaluation",
-    }
-    content = [{"type": "text", "text": prompt}]
-    for frame_base64 in frames_base64:
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/jpeg;base64,{frame_base64}"},
-        })
-
-    payload = {
-        "model": model,
-        "stream": stream,
-        "messages": [{"role": "user", "content": content}],
-    }
-    if temperature is not None:
-        payload["temperature"] = temperature
-    if top_p is not None:
-        payload["top_p"] = top_p
-
-    if stream:
-        resp = requests.post(url, json=payload, headers=headers, stream=True, timeout=45)
-        resp.raise_for_status()
-        full_text = ""
-        for line in resp.iter_lines():
-            if not line:
-                continue
-            line = line.decode("utf-8")
-            if line.startswith("data: "):
-                data = line[6:]
-                if data == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data)
-                    delta = chunk["choices"][0].get("delta", {})
-                    if "content" in delta:
-                        full_text += delta["content"]
-                except (json.JSONDecodeError, KeyError):
-                    pass
-        return full_text
-
-    resp = requests.post(url, json=payload, headers=headers, timeout=45)
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
-
-
-def parse_json_response(text: str) -> Optional[Dict[str, Any]]:
-    """Parse strict JSON from a model response, tolerating markdown fences."""
-    text = text.strip()
-    if not text:
-        return None
-
-    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if fence_match:
-        text = fence_match.group(1).strip()
-    else:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            text = text[start:end + 1]
-
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
+def append_jsonl(path: Optional[Path], item: Dict[str, Any]) -> None:
+    if not path:
+        return
+    with path.open("a") as handle:
+        handle.write(json.dumps(item) + "\n")
 
 # ==========================================================================
 # YOUR PIPELINE — IMPLEMENT THESE CALLBACKS
@@ -200,539 +57,314 @@ def parse_json_response(text: str) -> Optional[Dict[str, Any]]:
 
 class Pipeline:
     """
-    Your VLM orchestration pipeline.
+    Harness-facing descriptor/reasoner pipeline.
 
-    The harness calls on_frame() and on_audio() in real-time as the video plays.
-    When you detect an event, call self.harness.emit_event({...}).
-
-    Key design decisions you need to make:
-    - Which frames to send to the VLM (not every frame — budget is limited)
-    - Whether/how to use audio (speech-to-text for instructor corrections?)
-    - Which model to use and when (cheap for easy frames, expensive for hard ones?)
-    - How to track procedure state (current step, completed steps)
-    - How to generate spoken responses for errors
+    The main file only owns streaming state and event emission. The descriptor
+    and reasoner modules own the model prompts, JSON parsing, and response
+    handling used by the offline experiments.
     """
 
     def __init__(
         self,
+        *,
         harness: StreamingHarness,
         api_key: str,
         procedure: Dict[str, Any],
-        model: str = "google/gemini-2.5-flash",
-        temperature: Optional[float] = None,
-        top_p: Optional[float] = None,
-        step_rubrics: Optional[List[Dict[str, Any]]] = None,
-        step_rubric_mode: str = "soft",
-        vlm_log_path: Optional[str] = None,
-        vlm_log_start: Optional[float] = None,
-        vlm_log_end: Optional[float] = None,
-    ):
+        descriptor_model: str,
+        reasoner_model: str,
+        descriptor_temperature: Optional[float],
+        reasoner_temperature: Optional[float],
+        descriptor_top_p: Optional[float],
+        reasoner_top_p: Optional[float],
+        descriptor_timeout_sec: int,
+        frame_sampler: str,
+        sampler_metric: str,
+        jpeg_quality: int,
+        frames_per_descriptor_window: int,
+        reasoner_windows_per_call: int,
+        step_confidence_threshold: float,
+        error_confidence_threshold: float,
+        step_rubric: Optional[str],
+        descriptor_log: Optional[str],
+        reasoner_log: Optional[str],
+    ) -> None:
         self.harness = harness
         self.api_key = api_key
         self.procedure = procedure
         self.task_name = procedure.get("task") or procedure.get("task_name", "Unknown")
         self.steps = procedure["steps"]
-        self.step_by_id = {step["step_id"]: step for step in self.steps}
 
-        self.model = model
-        self.temperature = temperature
-        self.top_p = top_p
-        self.frame_buffer = deque(maxlen=20)
-        self.frames_per_call = 10
-        self.call_interval_sec = 5.0
-        self.last_vlm_call_ts = -self.call_interval_sec
+        self.descriptor_model = descriptor_model
+        self.descriptor_temperature = descriptor_temperature
+        self.descriptor_top_p = descriptor_top_p
+        self.descriptor_timeout_sec = descriptor_timeout_sec
+        self.frame_sampler = frame_sampler
+        self.sampler_metric = sampler_metric
+        self.jpeg_quality = jpeg_quality
+        self.frames_per_descriptor_window = max(frames_per_descriptor_window, 3)
+        self.reasoner_windows_per_call = max(reasoner_windows_per_call, 1)
 
-        self.state_lock = threading.RLock()
-        self.completed_steps = set()
-        self.current_step_index = 0
-        self.visual_context = VisualContextManager(
-            self.steps,
-            step_rubrics=step_rubrics,
-            step_rubric_mode=step_rubric_mode,
+        self.descriptor_log_path = Path(descriptor_log) if descriptor_log else None
+        if self.descriptor_log_path:
+            self.descriptor_log_path.parent.mkdir(parents=True, exist_ok=True)
+            self.descriptor_log_path.write_text("")
+
+        rubrics = load_step_rubrics(step_rubric) if step_rubric else []
+        self.reasoner = RoutingReasoner(
+            procedure=procedure,
+            rubrics=rubrics,
+            api_key=api_key,
+            model=reasoner_model,
+            temperature=reasoner_temperature,
+            top_p=reasoner_top_p,
+            step_confidence_threshold=step_confidence_threshold,
+            error_confidence_threshold=error_confidence_threshold,
+            windows_per_call=self.reasoner_windows_per_call,
+            reasoner_log_path=reasoner_log,
         )
-        self.emitted_error_times = []
-        self.last_raw_vlm_response = ""
-        self.last_status = {}
-        self.api_calls = 0
-        self.vlm_log_path = Path(vlm_log_path) if vlm_log_path else None
-        self.vlm_log_start = vlm_log_start
-        self.vlm_log_end = vlm_log_end
-        self.vlm_log_count = 0
-        self.vlm_log_records = []
-        self.vlm_log_lock = threading.Lock()
-        if self.vlm_log_path:
-            self.vlm_log_path.parent.mkdir(parents=True, exist_ok=True)
-            self.vlm_log_path.write_text("[]" if self.vlm_log_path.suffix == ".json" else "")
 
-        self.step_confidence_threshold = 0.60
-        self.error_confidence_threshold = 0.55
-        self.error_cooldown_sec = 2.0
+        self._frame_buffer: List[np.ndarray] = []
+        self._timestamp_buffer: List[float] = []
+        self._descriptor_windows: List[Dict[str, Any]] = []
+        self._pending_reasoner_windows: List[Dict[str, Any]] = []
+        self._descriptor_call_count = 0
+        self._reasoner_call_count = 0
 
-    def on_frame(self, frame: np.ndarray, timestamp_sec: float, frame_base64: str):
-        """
-        Called by the harness for each video frame.
+    def on_frame(self, frame: np.ndarray, timestamp_sec: float, frame_base64: str) -> None:
+        del frame_base64
+        self._frame_buffer.append(frame.copy())
+        self._timestamp_buffer.append(float(timestamp_sec))
+        if len(self._frame_buffer) >= self.frames_per_descriptor_window:
+            self.process_descriptor_window()
 
-        Args:
-            frame: BGR numpy array (raw frame)
-            timestamp_sec: Current video timestamp
-            frame_base64: Pre-encoded JPEG base64 string (ready for VLM API)
+    def on_audio(self, audio_bytes: bytes, start_sec: float, end_sec: float) -> None:
+        del audio_bytes, start_sec, end_sec
+        # Audio is intentionally ignored for now.
 
-        TODO: Implement your frame processing logic.
-        When you detect an event, call:
-            self.harness.emit_event({
-                "timestamp_sec": timestamp_sec,
-                "type": "step_completion",  # or "error_detected" or "idle_detected"
-                "step_id": 1,
-                "confidence": 0.9,
-                "description": "...",
-                "source": "video",
-                "vlm_observation": "...",
-                # For errors, also include:
-                "spoken_response": "Stop — you need to turn off the power first.",
-            })
-        """
-        with self.state_lock:
-            self.frame_buffer.append({
-                "timestamp_sec": timestamp_sec,
-                "frame_base64": frame_base64,
-            })
-            if (
-                len(self.frame_buffer) < self.frames_per_call
-                or timestamp_sec - self.last_vlm_call_ts < self.call_interval_sec
-            ):
-                return
-            selected_frames = list(self.frame_buffer)[-self.frames_per_call:]
-            self.last_vlm_call_ts = timestamp_sec
+    def on_complete(self) -> None:
+        if len(self._frame_buffer) >= 3:
+            self.process_descriptor_window()
+        if self._pending_reasoner_windows:
+            self.process_reasoner_windows(force=True)
 
-        prompt = self._build_visual_prompt(selected_frames)
+    def process_descriptor_window(self) -> None:
+        frames = self._frame_buffer
+        timestamps = self._timestamp_buffer
+        self._frame_buffer = []
+        self._timestamp_buffer = []
+
+        if len(frames) < 3:
+            return
+
+        self._descriptor_call_count += 1
+        window = {
+            "source_log_index": self._descriptor_call_count,
+            "frame_window": [round(timestamps[0], 3), round(timestamps[-1], 3)],
+            "candidate_frame_timestamps": [round(timestamp, 3) for timestamp in timestamps],
+            "midpoint_sec": round((timestamps[0] + timestamps[-1]) / 2, 3),
+        }
+        current_step = self.reasoner.current_step()
+        current_step_id = int(current_step["step_id"]) if current_step else int(self.steps[-1]["step_id"])
+
         try:
-            response = call_vlm_multi_frame(
+            selected_frames, selected_timestamps, selection_log = self.select_descriptor_frames(frames, timestamps)
+            encoded_frames = [
+                frame_to_base64(frame, self.jpeg_quality)
+                for frame in selected_frames
+            ]
+            prompt = build_descriptor_prompt(
+                procedure=self.procedure,
+                frame_timestamps=selected_timestamps,
+                current_step_id=current_step_id,
+            )
+            raw_response = call_openrouter_descriptor(
                 api_key=self.api_key,
-                frames_base64=[item["frame_base64"] for item in selected_frames],
+                frames_base64=encoded_frames,
                 prompt=prompt,
-                model=self.model,
-                temperature=self.temperature,
-                top_p=self.top_p,
+                model=self.descriptor_model,
+                temperature=self.descriptor_temperature,
+                top_p=self.descriptor_top_p,
+                timeout_sec=self.descriptor_timeout_sec,
             )
-            self.api_calls += 1
-            self.last_raw_vlm_response = response
-        except requests.RequestException as exc:
-            print(f"  [pipeline] Visual VLM failed at {timestamp_sec:.1f}s: {exc}")
-            return
-
-        parsed = parse_json_response(response)
-        if not parsed:
-            self._maybe_log_vlm_call("visual_window", selected_frames, prompt, response, None)
-            print(f"  [pipeline] Could not parse visual VLM JSON at {timestamp_sec:.1f}s")
-            return
-
-        self._maybe_log_vlm_call("visual_window", selected_frames, prompt, response, parsed)
-        self._handle_vlm_result(parsed, selected_frames, response, source="video")
-
-    def on_audio(self, audio_bytes: bytes, start_sec: float, end_sec: float):
-        """
-        Called by the harness for each audio chunk.
-
-        Args:
-            audio_bytes: Raw PCM audio (16kHz, mono, 16-bit)
-            start_sec: Chunk start time in video
-            end_sec: Chunk end time in video
-
-        Audio is intentionally ignored in the visual-only baseline. The challenge
-        update says instructor audio can leak error labels, so STT experiments
-        live in audio_stt_experiment.py instead of this runtime pipeline.
-        """
-        return
-
-    def finish(self):
-        """No async work to finalize in the visual-only baseline."""
-        return
-
-    def _maybe_log_vlm_call(
-        self,
-        source: str,
-        selected_frames: List[Dict[str, Any]],
-        prompt: str,
-        response: str,
-        parsed: Optional[Dict[str, Any]],
-    ) -> None:
-        if not self.vlm_log_path or not selected_frames:
-            return
-
-        frame_times = [frame["timestamp_sec"] for frame in selected_frames]
-        window_start = min(frame_times)
-        window_end = max(frame_times)
-        if self.vlm_log_start is not None and window_end < self.vlm_log_start:
-            return
-        if self.vlm_log_end is not None and window_start > self.vlm_log_end:
-            return
-
-        with self.state_lock:
-            current_step = self._current_step()
-            state = self.visual_context.state_snapshot(
-                completed_steps=sorted(self.completed_steps),
-                current_step_id=current_step.get("step_id") if current_step else None,
+            parsed = parse_json_response(raw_response)
+            window_description = normalize_window_description(parsed)
+            error = None
+        except Exception as exc:
+            selected_timestamps = timestamps
+            selection_log = None
+            prompt = build_descriptor_prompt(
+                procedure=self.procedure,
+                frame_timestamps=selected_timestamps,
+                current_step_id=current_step_id,
             )
+            raw_response = ""
+            parsed = None
+            window_description = None
+            error = str(exc)
+            print(f"  [descriptor] {window['frame_window'][0]:.1f}-{window['frame_window'][1]:.1f}s ERROR: {exc}")
 
-        record = {
-            "source": source,
-            "frame_window": [window_start, window_end],
-            "frame_timestamps": frame_times,
-            "state_before_response": state,
-            "prompt": prompt,
-            "raw_response": response,
-            "parsed_response": parsed,
+        described_window = {
+            **window,
+            "frame_timestamps": [round(timestamp, 3) for timestamp in selected_timestamps],
+            "current_step_id_hint": current_step_id,
+            "window_description": window_description,
         }
-        if isinstance(parsed, dict):
-            record["visual_context"] = self.visual_context.response_log_context(parsed)
-        with self.vlm_log_lock:
-            self.vlm_log_count += 1
-            record["log_index"] = self.vlm_log_count
-            if self.vlm_log_path.suffix == ".json":
-                self.vlm_log_records.append(record)
-                self.vlm_log_path.write_text(json.dumps(self.vlm_log_records, indent=2))
-            else:
-                with self.vlm_log_path.open("a") as f:
-                    f.write(json.dumps(record) + "\n")
+        self._descriptor_windows.append(described_window)
+        self._pending_reasoner_windows.append(described_window)
 
-    def _build_visual_prompt(self, selected_frames: List[Dict[str, Any]]) -> str:
-        with self.state_lock:
-            completed = sorted(self.completed_steps)
-            current_step = self._current_step()
-            next_steps = self.steps[self.current_step_index + 1:self.current_step_index + 2]
-            return self.visual_context.build_prompt(
-                task_name=self.task_name,
-                selected_frames=selected_frames,
-                completed_steps=completed,
-                current_step=current_step,
-                next_steps=next_steps,
-            )
-
-    def _handle_vlm_result(
-        self,
-        parsed: Dict[str, Any],
-        selected_frames: List[Dict[str, Any]],
-        raw_response: str,
-        source: str = "both",
-    ) -> List[Dict[str, Any]]:
-        events = parsed.get("events", [])
-        if not isinstance(events, list):
-            events = []
-        status = parsed.get("status", {})
-        if isinstance(status, dict):
-            self.last_status = status
-
-        frame_times = [frame["timestamp_sec"] for frame in selected_frames]
-        min_ts = min(frame_times)
-        max_ts = max(frame_times)
-        self._update_visual_context(parsed, frame_times)
-
-        step_events = [
-            event for event in events
-            if isinstance(event, dict) and event.get("type") == "step_completion"
-        ]
-        emitted_events = self._emit_ordered_steps(step_events, min_ts, max_ts, raw_response, source)
-
-        for event in events:
-            if not isinstance(event, dict):
-                continue
-            event_type = event.get("type")
-            if event_type == "error_detected":
-                emitted = self._maybe_emit_error(event, min_ts, max_ts, raw_response, source=source)
-                if emitted:
-                    emitted_events.append(emitted)
-
-        event_proposals = [
-            event for event in events
-            if isinstance(event, dict) and event.get("type") in {"step_completion", "error_detected"}
-        ]
-        if event_proposals:
-            self._print_event_proposals(event_proposals, frame_times, emitted_events)
-        return emitted_events
-
-    def _update_visual_context(self, parsed: Dict[str, Any], frame_times: List[float]) -> None:
-        with self.state_lock:
-            self.visual_context.update_from_response(parsed, frame_times)
-
-    def _emit_ordered_steps(
-        self,
-        step_events: List[Dict[str, Any]],
-        min_ts: float,
-        max_ts: float,
-        raw_response: str,
-        source: str,
-    ) -> List[Dict[str, Any]]:
-        emitted_events = []
-        events_by_step = {}
-        for event in step_events:
-            step_id = self._as_int(event.get("step_id"))
-            if step_id is None or step_id in self.completed_steps:
-                continue
-            confidence = self._as_float(event.get("confidence"), default=0.0)
-            if confidence < self.step_confidence_threshold:
-                continue
-            existing = events_by_step.get(step_id)
-            if existing is None or confidence > self._as_float(existing.get("confidence"), default=0.0):
-                events_by_step[step_id] = event
-
-        while self.current_step_index < len(self.steps):
-            expected_step_id = self.steps[self.current_step_index]["step_id"]
-            event = events_by_step.get(expected_step_id)
-            if event is None:
-                break
-            emitted = self._emit_step(event, min_ts, max_ts, raw_response, source)
-            if emitted:
-                emitted_events.append(emitted)
-        return emitted_events
-
-    def _emit_step(
-        self,
-        event: Dict[str, Any],
-        min_ts: float,
-        max_ts: float,
-        raw_response: str,
-        source: str,
-    ) -> Optional[Dict[str, Any]]:
-        step_id = self._as_int(event.get("step_id"))
-        if step_id is None:
-            return None
-        expected_step = self._current_step()
-        if not expected_step or step_id != expected_step["step_id"]:
-            return None
-
-        confidence = self._as_float(event.get("confidence"), default=0.0)
-        timestamp_sec = self._bounded_timestamp(event.get("timestamp_sec"), min_ts, max_ts)
-        step = self.step_by_id[step_id]
-        emitted = {
-            "timestamp_sec": timestamp_sec,
-            "type": "step_completion",
-            "step_id": step_id,
-            "confidence": confidence,
-            "description": event.get("description") or step["description"],
-            "source": source,
-            "vlm_observation": raw_response[:1200],
-        }
-        for key in ("matched_phase", "rubric_reference", "completion_reasoning"):
-            value = event.get(key)
-            if isinstance(value, (str, dict, list)):
-                emitted[key] = value
-        self.harness.emit_event(emitted)
-
-        self.completed_steps.add(step_id)
-        while (
-            self.current_step_index < len(self.steps)
-            and self.steps[self.current_step_index]["step_id"] in self.completed_steps
-        ):
-            self.current_step_index += 1
-        return emitted
-
-    def _maybe_emit_error(
-        self,
-        event: Dict[str, Any],
-        min_ts: float,
-        max_ts: float,
-        raw_response: str,
-        source: str = "video",
-    ) -> Optional[Dict[str, Any]]:
-        confidence = self._as_float(event.get("confidence"), default=0.0)
-        if confidence < self.error_confidence_threshold:
-            return None
-
-        timestamp_sec = self._bounded_timestamp(event.get("timestamp_sec"), min_ts, max_ts)
-        with self.state_lock:
-            if any(abs(timestamp_sec - prior) < self.error_cooldown_sec for prior in self.emitted_error_times):
-                return None
-            self.emitted_error_times.append(timestamp_sec)
-
-        error_type = event.get("error_type") or "other"
-        if error_type not in self.harness.VALID_ERROR_TYPES:
-            error_type = "other"
-        severity = event.get("severity") or "warning"
-        if severity not in self.harness.VALID_SEVERITIES:
-            severity = "warning"
-
-        emitted = {
-            "timestamp_sec": timestamp_sec,
-            "type": "error_detected",
-            "confidence": confidence,
-            "error_type": error_type,
-            "severity": severity,
-            "description": event.get("description") or "Possible procedure error detected.",
-            "spoken_response": event.get("spoken_response") or "Stop and check the procedure before continuing.",
-            "source": source,
-            "vlm_observation": raw_response[:1200],
-        }
-        self.harness.emit_event(emitted)
-        return emitted
-
-    def _print_event_proposals(
-        self,
-        event_proposals: List[Dict[str, Any]],
-        frame_times: List[float],
-        emitted_events: List[Dict[str, Any]],
-    ) -> None:
+        action = (window_description or {}).get("student_action", "")
         print(
-            f"  [pipeline] VLM event proposal call={self.api_calls} "
-            f"window={frame_times[0]:.1f}-{frame_times[-1]:.1f}s "
-            f"proposed={len(event_proposals)} emitted={len(emitted_events)}"
+            f"  [descriptor] {window['frame_window'][0]:.1f}-{window['frame_window'][1]:.1f}s "
+            f"step_hint={current_step_id}: {action[:160]}"
         )
-        for event in event_proposals:
-            event_type = event.get("type")
-            timestamp_sec = self._as_float(event.get("timestamp_sec"), default=frame_times[-1])
-            confidence = self._as_float(event.get("confidence"), default=0.0)
-            description = (event.get("description") or "")[:120]
-            if event_type == "step_completion":
+        append_jsonl(self.descriptor_log_path, {
+            **window,
+            "selected_frame_timestamps": [round(timestamp, 3) for timestamp in selected_timestamps],
+            "frame_selection": selection_log,
+            "current_step_id_hint": current_step_id,
+            "prompt": prompt,
+            "raw_response": raw_response,
+            "parsed_response": parsed,
+            "window_description": window_description,
+            "error": error,
+        })
+        self.process_reasoner_windows()
+
+    def select_descriptor_frames(
+        self,
+        frames: List[np.ndarray],
+        timestamps: List[float],
+    ) -> tuple[List[np.ndarray], List[float], Optional[Dict[str, Any]]]:
+        if self.frame_sampler == "uniform":
+            return frames, timestamps, None
+        if self.frame_sampler != "smart":
+            raise ValueError(f"Unknown frame sampler: {self.frame_sampler}")
+
+        selected = smart_select_frames(
+            frames=frames,
+            timestamps=timestamps,
+            metric=self.sampler_metric,
+        )
+        selection_log = {
+            "sampler": self.frame_sampler,
+            "metric": self.sampler_metric,
+            "candidate_timestamps": [round(timestamp, 3) for timestamp in timestamps],
+            "selected_frames": [item.__dict__ for item in selected],
+        }
+        return (
+            [frames[item.index] for item in selected],
+            [item.timestamp_sec for item in selected],
+            selection_log,
+        )
+
+    def process_reasoner_windows(self, force: bool = False) -> None:
+        if not force and len(self._pending_reasoner_windows) < self.reasoner_windows_per_call:
+            return
+        while self._pending_reasoner_windows and (
+            force or len(self._pending_reasoner_windows) >= self.reasoner_windows_per_call
+        ):
+            group_windows = self._pending_reasoner_windows[:self.reasoner_windows_per_call]
+            self._pending_reasoner_windows = self._pending_reasoner_windows[self.reasoner_windows_per_call:]
+            group = make_window_groups(group_windows, len(group_windows))[0]
+            self._reasoner_call_count += 1
+            try:
+                emitted = self.reasoner.process_group(group, index=self._reasoner_call_count)
+            except Exception as exc:
                 print(
-                    f"    proposed step_completion step={event.get('step_id')} "
-                    f"t={timestamp_sec:.1f}s conf={confidence:.2f} desc={description}"
+                    f"  [reasoner] {group.get('frame_window')} ERROR: {exc}"
                 )
-            else:
+                continue
+            for event in emitted:
+                self.emit_event(event)
+            if emitted:
                 print(
-                    f"    proposed error_detected t={timestamp_sec:.1f}s "
-                    f"conf={confidence:.2f} type={event.get('error_type', 'other')} "
-                    f"desc={description}"
-                )
-        for event in emitted_events:
-            if event["type"] == "step_completion":
-                print(
-                    f"    emitted step_completion step={event.get('step_id')} "
-                    f"t={event['timestamp_sec']:.1f}s conf={event.get('confidence', 0):.2f}"
-                )
-            else:
-                print(
-                    f"    emitted error_detected t={event['timestamp_sec']:.1f}s "
-                    f"conf={event.get('confidence', 0):.2f} type={event.get('error_type', 'other')}"
+                    f"  [reasoner] {group.get('frame_window')} emitted={len(emitted)} "
+                    f"completed={sorted(self.reasoner.completed_steps)}"
                 )
 
-    def _current_step(self) -> Optional[Dict[str, Any]]:
-        if self.current_step_index >= len(self.steps):
-            return None
-        return self.steps[self.current_step_index]
-
-    @staticmethod
-    def _as_int(value: Any) -> Optional[int]:
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return None
-
-    @staticmethod
-    def _as_float(value: Any, default: float) -> float:
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return default
-
-    def _bounded_timestamp(self, value: Any, min_ts: float, max_ts: float) -> float:
-        timestamp_sec = self._as_float(value, default=max_ts)
-        return max(min_ts, min(max_ts, timestamp_sec))
+    def emit_event(self, event: Dict[str, Any]) -> None:
+        allowed = {
+            "timestamp_sec",
+            "type",
+            "step_id",
+            "confidence",
+            "description",
+            "source",
+            "reason",
+            "reasoner_observation",
+            "matched_phase",
+            "error_type",
+            "severity",
+            "spoken_response",
+        }
+        output = {key: value for key, value in event.items() if key in allowed}
+        if output.get("type") == "error_detected":
+            output.setdefault("severity", "warning")
+            output.setdefault("spoken_response", "Stop and return to the current step.")
+        self.harness.emit_event(output)
 
 
-# ==========================================================================
-# MAIN ENTRY POINT
-# ==========================================================================
-
-def main():
-    load_dotenv(Path(__file__).parent.parent / ".env")
-
-    parser = argparse.ArgumentParser(description="VLM Orchestrator Pipeline")
+def main() -> None:
+    load_dotenv()
+    parser = argparse.ArgumentParser(description="Descriptor/reasoner VLM Orchestrator Pipeline")
     parser.add_argument("--procedure", required=True, help="Path to procedure JSON")
-    parser.add_argument("--video", required=True, help="Path to video MP4 (with audio)")
+    parser.add_argument("--video", required=True, help="Path to video MP4")
     parser.add_argument("--output", default="output/events.json", help="Output JSON path")
-    parser.add_argument("--speed", type=float, default=1.0,
-                        help="Playback speed (1.0 = real-time, 2.0 = 2x, etc.)")
-    parser.add_argument("--frame-fps", type=float, default=2.0,
-                        help="Frames per second delivered to pipeline (default: 2)")
-    parser.add_argument("--audio-chunk-sec", type=float, default=5.0,
-                        help="Audio chunk duration in seconds (default: 5)")
-    parser.add_argument("--api-key", help="OpenRouter API key (or set OPENROUTER_API_KEY)")
-    parser.add_argument("--model", default="google/gemini-2.5-flash",
-                        help="OpenRouter model string for VLM calls")
-    parser.add_argument("--temperature", type=float,
-                        help="Optional VLM sampling temperature")
-    parser.add_argument("--top-p", type=float,
-                        help="Optional VLM nucleus sampling top_p")
-    parser.add_argument("--step-rubric",
-                        help="Load an existing procedure-only step rubric JSON")
-    parser.add_argument("--step-rubric-output",
-                        help="Path to write/read generated step rubric JSON")
-    parser.add_argument("--no-step-rubric", action="store_true",
-                        help="Disable procedure-only step rubrics for this run")
-    parser.add_argument("--step-rubric-mode", choices=["soft", "strict"], default="soft",
-                        help="How strongly runtime prompt treats step rubrics")
-    parser.add_argument("--regenerate-step-rubric", action="store_true",
-                        help="Ignore cached step rubric and regenerate it")
-    parser.add_argument("--rubric-model",
-                        default="google/gemini-2.5-pro",
-                        help="OpenRouter model string for rubric generation (default: google/gemini-2.5-pro)")
-    parser.add_argument("--vlm-log", help="Optional .json or .jsonl path for VLM prompt/response debug logs")
-    parser.add_argument("--vlm-log-start", type=float,
-                        help="Only log VLM calls whose frame window overlaps this timestamp")
-    parser.add_argument("--vlm-log-end", type=float,
-                        help="Only log VLM calls whose frame window overlaps this timestamp")
+    parser.add_argument("--speed", type=float, default=1.0)
+    parser.add_argument("--frame-fps", type=float, default=2.0)
+    parser.add_argument("--audio-chunk-sec", type=float, default=5.0)
+    parser.add_argument("--api-key", help="OpenRouter API key, or set OPENROUTER_API_KEY")
+    parser.add_argument("--descriptor-model", default="google/gemini-3.1-flash-image-preview")
+    parser.add_argument("--reasoner-model", default="google/gemini-3.1-pro-preview")
+    parser.add_argument("--descriptor-temperature", type=float, default=0.2)
+    parser.add_argument("--reasoner-temperature", type=float, default=0.2)
+    parser.add_argument("--descriptor-top-p", type=float)
+    parser.add_argument("--reasoner-top-p", type=float)
+    parser.add_argument("--descriptor-timeout-sec", type=int, default=90)
+    parser.add_argument("--frame-sampler", choices=["uniform", "smart"], default="smart")
+    parser.add_argument("--sampler-metric", choices=["ssim", "mad"], default="ssim")
+    parser.add_argument("--jpeg-quality", type=int, default=80)
+    parser.add_argument("--frames-per-descriptor-window", type=int, default=10)
+    parser.add_argument("--reasoner-windows-per-call", type=int, default=2)
+    parser.add_argument("--step-confidence-threshold", type=float, default=0.55)
+    parser.add_argument("--error-confidence-threshold", type=float, default=0.60)
+    parser.add_argument("--step-rubric", help="Optional reasoner rubric JSON; descriptor never uses rubrics")
+    parser.add_argument("--descriptor-log", help="Optional descriptor JSONL trace")
+    parser.add_argument("--reasoner-log", help="Optional reasoner JSONL trace")
     parser.add_argument("--dry-run", action="store_true", help="Validate inputs only")
     args = parser.parse_args()
 
-    # Load procedure
     print("=" * 60)
-    print("  VLM ORCHESTRATOR")
+    print("  VLM ORCHESTRATOR - DESCRIPTOR/REASONER ROUTING")
     print("=" * 60)
     print()
 
     procedure = load_procedure_json(args.procedure)
     validate_procedure_format(procedure)
     task_name = procedure.get("task") or procedure.get("task_name", "Unknown")
-    print(f"  Procedure: {task_name} ({len(procedure['steps'])} steps)")
-    print(f"  Video:     {args.video}")
-    print(f"  Speed:     {args.speed}x")
-    print(f"  Model:     {args.model}")
-    if args.temperature is not None or args.top_p is not None:
-        print(f"  Sampling:  temperature={args.temperature}, top_p={args.top_p}")
-    print("  Audio:     ignored (visual-only baseline)")
-    print()
-
-    api_key = args.api_key or os.getenv("OPENROUTER_API_KEY")
-    rubric_model = args.rubric_model
-    step_rubrics = []
-    if args.no_step_rubric:
-        print("  Step rubrics: disabled")
-    else:
-        try:
-            step_rubrics, rubric_path, rubric_source = resolve_step_rubrics(
-                api_key=api_key,
-                procedure=procedure,
-                procedure_path=args.procedure,
-                explicit_path=args.step_rubric,
-                output_path=args.step_rubric_output,
-                regenerate=args.regenerate_step_rubric,
-                model=rubric_model,
-            )
-            print(
-                f"  Step rubrics: {rubric_source} "
-                f"({len(step_rubrics)} steps) -> {rubric_path}"
-            )
-            print(f"  Step rubric mode: {args.step_rubric_mode}")
-        except (ValueError, requests.RequestException, OSError, json.JSONDecodeError) as exc:
-            print(f"  WARNING: Step rubrics unavailable, falling back to base prompt: {exc}")
+    print(f"  Procedure:  {task_name} ({len(procedure['steps'])} steps)")
+    print(f"  Video:      {args.video}")
+    print(f"  Speed:      {args.speed}x")
+    print(f"  Descriptor: {args.descriptor_model}")
+    print(f"  Reasoner:   {args.reasoner_model}")
+    print(f"  Sampler:    {args.frame_sampler}" + (f" ({args.sampler_metric})" if args.frame_sampler == "smart" else ""))
     print()
 
     if args.dry_run:
         if not Path(args.video).exists():
             print(f"  WARNING: Video not found: {args.video}")
-            print("  [DRY RUN] Procedure validated. Video not checked (file missing).")
-        else:
-            print("  [DRY RUN] Inputs validated. Skipping pipeline.")
+        print("  [DRY RUN] Inputs validated. Skipping pipeline.")
         return
 
     if not Path(args.video).exists():
         print(f"  ERROR: Video not found: {args.video}")
         sys.exit(1)
 
+    api_key = args.api_key or os.getenv("OPENROUTER_API_KEY")
     if not api_key:
         print("  ERROR: Set OPENROUTER_API_KEY or pass --api-key")
         sys.exit(1)
 
-    # Create harness and pipeline
     harness = StreamingHarness(
         video_path=args.video,
         procedure_path=args.procedure,
@@ -740,39 +372,40 @@ def main():
         frame_fps=args.frame_fps,
         audio_chunk_sec=args.audio_chunk_sec,
     )
-
     pipeline = Pipeline(
-        harness,
-        api_key,
-        procedure,
-        model=args.model,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        step_rubrics=step_rubrics,
-        step_rubric_mode=args.step_rubric_mode,
-        vlm_log_path=args.vlm_log,
-        vlm_log_start=args.vlm_log_start,
-        vlm_log_end=args.vlm_log_end,
+        harness=harness,
+        api_key=api_key,
+        procedure=procedure,
+        descriptor_model=args.descriptor_model,
+        reasoner_model=args.reasoner_model,
+        descriptor_temperature=args.descriptor_temperature,
+        reasoner_temperature=args.reasoner_temperature,
+        descriptor_top_p=args.descriptor_top_p,
+        reasoner_top_p=args.reasoner_top_p,
+        descriptor_timeout_sec=args.descriptor_timeout_sec,
+        frame_sampler=args.frame_sampler,
+        sampler_metric=args.sampler_metric,
+        jpeg_quality=args.jpeg_quality,
+        frames_per_descriptor_window=args.frames_per_descriptor_window,
+        reasoner_windows_per_call=args.reasoner_windows_per_call,
+        step_confidence_threshold=args.step_confidence_threshold,
+        error_confidence_threshold=args.error_confidence_threshold,
+        step_rubric=args.step_rubric,
+        descriptor_log=args.descriptor_log,
+        reasoner_log=args.reasoner_log,
     )
 
-    # Register callbacks
     harness.on_frame(pipeline.on_frame)
     harness.on_audio(pipeline.on_audio)
-    harness.on_complete(pipeline.finish)
+    harness.on_complete(pipeline.on_complete)
 
-    # Run
     results = harness.run()
-
-    # Save
     harness.save_results(results, args.output)
 
     print()
     print(f"  Output: {args.output}")
     print(f"  Events: {len(results.events)}")
     print()
-
-    if not results.events:
-        print("  WARNING: No events detected. Implement Pipeline.on_frame() and Pipeline.on_audio().")
 
 
 if __name__ == "__main__":
