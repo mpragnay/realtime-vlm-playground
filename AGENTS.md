@@ -1,13 +1,13 @@
 <claude-mem-context>
 # Memory Context
 
-# [realtime-vlm-playground-1] recent context, 2026-05-02 5:45pm EDT
+# [realtime-vlm-playground-1] recent context, 2026-05-02 9:15pm EDT
 
 Legend: 🎯session 🔴bugfix 🟣feature 🔄refactor ✅change 🔵discovery ⚖️decision
 Format: ID TIME TYPE TITLE
 Fetch details: get_observations([IDs]) | Search: mem-search skill
 
-Stats: 19 obs (6,712t read) | 170,326t work | 96% savings
+Stats: 22 obs (8,201t read) | 216,640t work | 96% savings
 
 ### Apr 30, 2026
 154 4:55p 🔵 Challenge Project: Real-Time Streaming Step Detection
@@ -29,8 +29,12 @@ Stats: 19 obs (6,712t read) | 170,326t work | 96% savings
 185 8:49p 🟣 src/run.py: Debug JSONL Logging for Event-Bearing VLM Calls
 186 8:50p 🔵 src/run.py: File State Reverted — Prior Refactor Changes Lost
 187 8:51p 🟣 src/run.py: Console Debug Printing for VLM Event Proposals vs Emissions
+### May 2, 2026
+192 9:01p 🔵 z045-june-24-22-dslr: Ground Truth vs Integrated Pipeline Output Comparison
+193 " 🔵 z045-integrated-events.json Evaluation Results: Step F1=0.25, Error F1=0.60
+197 9:02p 🔵 z045 Integrated Pipeline: Detailed GT vs Predicted Event Timing Analysis
 
-Access 170k tokens of past work via get_observations([IDs]) or mem-search skill.
+Access 217k tokens of past work via get_observations([IDs]) or mem-search skill.
 </claude-mem-context>
 
 ## Experiment Notes
@@ -332,4 +336,226 @@ Current working hypothesis:
 Keep the rubric lifecycle strict and auditable first. If RAM insertion becomes
 too conservative again, add a narrow, code-validated mechanism for hard-to-see
 mechanical steps rather than a broad prompt-only phase.
+```
+
+### 2026-05-02: z045 Descriptor/Reasoner Routing Experiment
+
+Purpose:
+
+- Test a two-agent routing architecture before changing the streaming runtime.
+- Descriptor stage: a lightweight image VLM describes each 5s frame window in
+  `window_description` format only; it does not emit steps/errors.
+- Reasoner stage: a text-only stronger model reads non-overlapping pairs of
+  descriptor windows (`0-10`, `10-20`, ...), procedure state, step rubrics, and
+  a running summary for the current step, then emits events.
+- The current experiment uses mock descriptor output extracted from
+  `output/z045-3.1-fresh-rubric.jsonl`, so the reasoner can be tested without
+  more image calls.
+
+Mock generation command:
+
+```bash
+.venv/bin/python - <<'PY'
+import json
+from pathlib import Path
+
+src = Path("output/z045-3.1-fresh-rubric.jsonl")
+out = Path("output/z045-window-descriptions-mock.json")
+windows = []
+with src.open() as f:
+    for idx, line in enumerate(f, start=1):
+        row = json.loads(line)
+        visual_context = row.get("visual_context") if isinstance(row.get("visual_context"), dict) else {}
+        parsed = row.get("parsed_response") if isinstance(row.get("parsed_response"), dict) else {}
+        frame_window = row.get("frame_window")
+        windows.append({
+            "source_log_index": row.get("log_index", idx),
+            "frame_window": frame_window,
+            "frame_timestamps": row.get("frame_timestamps"),
+            "midpoint_sec": round((frame_window[0] + frame_window[1]) / 2, 3) if frame_window else None,
+            "window_description": visual_context.get("window_description") or parsed.get("window_description"),
+        })
+out.write_text(json.dumps({
+    "source": "descriptor_mock_from_existing_vlm_log",
+    "clip": "z045-june-24-22-dslr",
+    "input_log": str(src),
+    "description": "Mock descriptor-agent output: per-window visual descriptions only, no events or status.",
+    "windows": windows,
+}, indent=2) + "\n")
+print(f"Saved {out} with {len(windows)} windows")
+PY
+```
+
+Routing run:
+
+```bash
+.venv/bin/python src/routing_experiment.py \
+  --procedure data/clip_procedures/z045-june-24-22-dslr.json \
+  --descriptions output/z045-window-descriptions-mock.json \
+  --step-rubric output/step_rubrics/z045-june-24-22-dslr-3.1-fresh-pro.json \
+  --output output/z045-routing-events.json \
+  --reasoner-log output/z045-routing-reasoner.jsonl \
+  --model google/gemini-3.1-pro-preview \
+  --temperature 0.2
+```
+
+Evaluation:
+
+```bash
+.venv/bin/python -m src.evaluator \
+  --predicted output/z045-routing-events.json \
+  --ground-truth data/ground_truth_sample/z045-june-24-22-dslr.json \
+  --tolerance 5
+```
+
+Latest result:
+
+```text
+STEP COMPLETION
+Precision: 20.0%
+Recall:    12.5%
+F1:        0.154
+1/8 matched
+
+ERROR DETECTION
+Precision: 33.3%
+Recall:    14.3%
+F1:        0.200
+1/7 matched
+```
+
+Emitted steps:
+
+```text
+step 1 @ 14.75s  just outside tolerance
+step 2 @ 24.75s  early
+step 3 @ 54.75s  matched
+step 4 @ 54.75s  early
+step 5 @ 84.75s  late, catch_up
+steps 6-8 missing
+```
+
+Key findings:
+
+- The routing reasoner is better at semantic error reasoning than the direct
+  VLM. It correctly identified the lens-hood wrong-object action while the
+  current step was lens-cover removal.
+- The reasoner still struggled with hidden-state control steps. For step 5 it
+  saw the power switch move at `70-79.5s`, but refused completion because the
+  LCD did not illuminate. It later emitted step 5 as catch-up at `84.75s`.
+- The run then got stuck at step 6, "turns off the DSLR," because no explicit
+  turn-off visual evidence appeared in the descriptor text. Ordered gating
+  blocked steps 7-8 even though the reasoner described battery/SD-card actions.
+- The running current-step summary worked mechanically and is logged in
+  `step_summaries_after`, but it did not solve the step-6 observability/gating
+  issue.
+
+Current conclusion:
+
+```text
+Descriptor/reasoner routing is promising for separating visual perception from
+event reasoning, especially for wrong-object errors. The next improvement is
+not more summary alone; it is better handling of hidden-state control steps and
+catch-up/bypass logic for steps like turn-on/turn-off where the video lacks a
+clear visual device-state indicator.
+```
+
+### 2026-05-02: z045 Routing Without Step Rubric
+
+Change:
+
+- Added no-rubric mode to `src/routing_experiment.py`.
+- In no-rubric mode, the reasoner does not receive precomputed lifecycle
+  rubrics. It reasons from the step text, running current-step summary, and
+  descriptor windows.
+- Prompt framing asks the model to infer flexible visual completion cues itself
+  and not make hard assumptions that every possible confirmation cue must occur.
+
+Run:
+
+```bash
+.venv/bin/python src/routing_experiment.py \
+  --procedure data/clip_procedures/z045-june-24-22-dslr.json \
+  --descriptions output/z045-window-descriptions-mock.json \
+  --output output/z045-routing-no-rubric-events.json \
+  --reasoner-log output/z045-routing-no-rubric-reasoner.jsonl \
+  --model google/gemini-3.1-pro-preview \
+  --temperature 0.2
+```
+
+Evaluate:
+
+```bash
+.venv/bin/python -m src.evaluator \
+  --predicted output/z045-routing-no-rubric-events.json \
+  --ground-truth data/ground_truth_sample/z045-june-24-22-dslr.json \
+  --tolerance 5
+```
+
+Result:
+
+```text
+STEP COMPLETION
+Precision: 40.0%
+Recall:    25.0%
+F1:        0.308
+2/8 matched
+
+ERROR DETECTION
+Precision: 33.3%
+Recall:    14.3%
+F1:        0.200
+1/7 matched
+```
+
+Compared to rubric routing:
+
+```text
+with rubric:    step F1 0.154, 1/8 matched
+without rubric: step F1 0.308, 2/8 matched
+```
+
+Step behavior:
+
+```text
+1: 14.75s  just outside tolerance
+2: 24.75s  early
+3: 54.75s  matched
+4: 54.75s  early
+5: 74.75s  matched
+6-8: missing
+```
+
+Key finding:
+
+- No-rubric reasoning fixed the hidden-state control issue for step 5. The
+  reasoner accepted the visible switch action as completion:
+
+```text
+description: student's left index finger applies pressure to the power switch dial
+reason: physical OFF/ON dial was actuated; even though LCD does not illuminate,
+the switch action is complete
+```
+
+- The rubric version had refused step 5 at `70-79.5s` because the LCD did not
+  illuminate, then emitted it late as catch-up at `84.75s`.
+- This suggests rigid rubrics can hurt when the step has hidden/internal state
+  or video lacks a clear final-state indicator.
+
+Remaining failure:
+
+- The reasoner still got stuck at step 6, "turns off the DSLR." No descriptor
+  window showed an explicit turn-off action, so ordered gating blocked battery
+  and SD-card steps 7-8 even though the text descriptions contained those
+  actions.
+
+Current hypothesis:
+
+```text
+For routing, we may be able to drop precomputed step rubrics entirely, or at
+least stop passing them to the descriptor. Let the descriptor produce grounded
+visual context without step-completion rubric pressure, then let the text
+reasoner infer practical completion cues from step text + running summary.
+Rubrics are useful for audit/debugging, but can overconstrain hidden-state or
+domain-specific actions.
 ```
