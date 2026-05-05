@@ -171,6 +171,7 @@ def build_descriptor_prompt(
     procedure: Dict[str, Any],
     frame_timestamps: List[float],
     current_step_id: int,
+    descriptor_error_guidance: Optional[Dict[str, Any]] = None,
 ) -> str:
     task_name = procedure.get("task") or procedure.get("task_name", "Unknown")
     steps = procedure["steps"]
@@ -181,6 +182,7 @@ def build_descriptor_prompt(
         f"- image_{index}: timestamp_sec={timestamp:.2f}"
         for index, timestamp in enumerate(frame_timestamps, start=1)
     )
+    error_guidance_text = format_descriptor_error_guidance(descriptor_error_guidance)
 
     return f"""
 You are the descriptor agent for a visual-only procedural task detector.
@@ -216,6 +218,14 @@ How to use these step hints:
 - Do not say a step is complete, incomplete, correct, wrong, or an error.
 - Avoid phrases like "this completes step X", "the student should", or "the
   correct object". Describe the visible evidence instead.
+
+Descriptor error guidance:
+These are possible visual scenarios that could indicate an error for the
+current step. If something like this appears in the frames, report it in
+detail in window_description. Do not decide whether it is an error; only
+describe the visible evidence carefully.
+
+{error_guidance_text}
 
 Current frames in chronological order:
 {frame_lines}
@@ -260,6 +270,24 @@ Return exactly one JSON object with this schema and no extra text:
   }}
 }}
 """.strip()
+
+
+def format_descriptor_error_guidance(guidance: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(guidance, dict) or not guidance:
+        return "None yet."
+
+    possible = guidance.get("possible_error_scenarios")
+    details = guidance.get("visual_details_to_report")
+    lines = []
+    if isinstance(possible, list) and possible:
+        lines.append("Possible error scenarios to watch for:")
+        for item in possible:
+            lines.append(f"- {item}")
+    if isinstance(details, list) and details:
+        lines.append("Visual details to report if visible:")
+        for item in details:
+            lines.append(f"- {item}")
+    return "\n".join(lines) if lines else json.dumps(guidance, indent=2)
 
 
 def normalize_window_description(parsed: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:

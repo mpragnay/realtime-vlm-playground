@@ -175,6 +175,7 @@ class RoutingReasoner:
         self.completed_steps: set[int] = set()
         self.current_step_index = 0
         self.step_summaries: Dict[int, str] = {}
+        self.descriptor_error_guidance: Optional[Dict[str, Any]] = None
         self.events: List[Dict[str, Any]] = []
         self.reasoner_log_path = Path(reasoner_log_path) if reasoner_log_path else None
         if self.reasoner_log_path:
@@ -257,6 +258,20 @@ General reasoning rules:
 - The running summary should combine previous summary and current descriptor
   evidence into a concise visual history of what has happened for the current
   step so far. Preserve uncertainty and do not turn speculation into fact.
+
+Descriptor error guidance rules:
+- After reasoning about this interval, output descriptor_error_guidance for the
+  next descriptor call. Base it on the expected step after any emitted
+  step_completion events in this response have been applied.
+- This guidance is not an error decision. It is a visual-only focus list for
+  what the descriptor should report in detail if it appears.
+- Generate concrete, step-specific possible error scenarios using these lenses:
+  wrong object or wrong location, failed or repeated attempt, improper
+  mechanical action, and unnecessary or reversal action.
+- Do not write generic guidance like "watch for errors". Mention specific
+  objects, controls, compartments, direction/orientation issues, repeated
+  fidgeting, release/lock/seated state, or reversal actions that are plausible
+  for the current or next expected step.
 
 Step completion rules:
 - A step_completion means the action for the current expected procedure step is
@@ -363,11 +378,22 @@ Return exactly one JSON object and no extra text:
       "step_id": {current_step.get("step_id") if current_step else "null"},
       "summary": "updated running visual summary for this step after the current interval"
     }}
-  ]
+  ],
+  "descriptor_error_guidance": {{
+    "possible_error_scenarios": [
+      "concrete visual scenario that could indicate a wrong object, failed attempt, improper mechanical action, or reversal for the next descriptor call"
+    ],
+    "visual_details_to_report": [
+      "specific object/control/compartment touched",
+      "whether the same action repeats without visible state change",
+      "whether the object is released, seated, locked, or still being manipulated",
+      "whether a similar-looking wrong object is used"
+    ]
+  }}
 }}
 Allowed event types: step_completion, error_detected.
 Allowed error_type values: wrong_action, safety_violation, improper_technique, other.
-If there are no events, return {{"events": [], "status": {{"type": "...", "description": "..."}}, "step_summary_updates": [...]}}.
+If there are no events, return {{"events": [], "status": {{"type": "...", "description": "..."}}, "step_summary_updates": [...], "descriptor_error_guidance": {{...}}}}.
 """.strip()
 
     def handle_response(
@@ -379,6 +405,7 @@ If there are no events, return {{"events": [], "status": {{"type": "...", "descr
         if not parsed or not isinstance(parsed.get("events"), list):
             if isinstance(parsed, dict):
                 self.update_step_summaries(parsed)
+                self.update_descriptor_error_guidance(parsed)
             return []
 
         emitted: List[Dict[str, Any]] = []
@@ -440,6 +467,7 @@ If there are no events, return {{"events": [], "status": {{"type": "...", "descr
                 self.events.append(output)
                 emitted.append(output)
         self.update_step_summaries(parsed)
+        self.update_descriptor_error_guidance(parsed)
         return emitted
 
     def log_call(
@@ -460,6 +488,7 @@ If there are no events, return {{"events": [], "status": {{"type": "...", "descr
             "completed_steps_after": sorted(self.completed_steps),
             "current_step_id_after": self.current_step().get("step_id") if self.current_step() else None,
             "step_summaries_after": self.step_summaries,
+            "descriptor_error_guidance_after": self.descriptor_error_guidance,
             "current_group": group,
             "prompt": prompt,
             "raw_response": raw_response,
@@ -507,6 +536,22 @@ If there are no events, return {{"events": [], "status": {{"type": "...", "descr
             if step_id is None or not isinstance(summary, str) or not summary.strip():
                 continue
             self.step_summaries[step_id] = summary.strip()
+
+    def update_descriptor_error_guidance(self, parsed: Dict[str, Any]) -> None:
+        guidance = parsed.get("descriptor_error_guidance")
+        if not isinstance(guidance, dict):
+            return
+        normalized: Dict[str, Any] = {}
+        for key in ("possible_error_scenarios", "visual_details_to_report"):
+            value = guidance.get(key)
+            if isinstance(value, list):
+                normalized[key] = [str(item).strip() for item in value if str(item).strip()]
+            elif isinstance(value, str) and value.strip():
+                normalized[key] = [value.strip()]
+            else:
+                normalized[key] = []
+        if normalized.get("possible_error_scenarios") or normalized.get("visual_details_to_report"):
+            self.descriptor_error_guidance = normalized
 
     def current_step_summary_text(self, current_step: Optional[Dict[str, Any]]) -> str:
         if not current_step:

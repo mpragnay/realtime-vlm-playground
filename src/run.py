@@ -165,6 +165,7 @@ class Pipeline:
         }
         current_step = self.reasoner.current_step()
         current_step_id = int(current_step["step_id"]) if current_step else int(self.steps[-1]["step_id"])
+        descriptor_error_guidance = self.reasoner.descriptor_error_guidance
 
         try:
             selected_frames, selected_timestamps, selection_log = self.select_descriptor_frames(frames, timestamps)
@@ -176,6 +177,7 @@ class Pipeline:
                 procedure=self.procedure,
                 frame_timestamps=selected_timestamps,
                 current_step_id=current_step_id,
+                descriptor_error_guidance=descriptor_error_guidance,
             )
             raw_response = call_openrouter_descriptor(
                 api_key=self.api_key,
@@ -196,6 +198,7 @@ class Pipeline:
                 procedure=self.procedure,
                 frame_timestamps=selected_timestamps,
                 current_step_id=current_step_id,
+                descriptor_error_guidance=descriptor_error_guidance,
             )
             raw_response = ""
             parsed = None
@@ -207,6 +210,7 @@ class Pipeline:
             **window,
             "frame_timestamps": [round(timestamp, 3) for timestamp in selected_timestamps],
             "current_step_id_hint": current_step_id,
+            "descriptor_error_guidance": descriptor_error_guidance,
             "window_description": window_description,
         }
         self._descriptor_windows.append(described_window)
@@ -222,6 +226,7 @@ class Pipeline:
             "selected_frame_timestamps": [round(timestamp, 3) for timestamp in selected_timestamps],
             "frame_selection": selection_log,
             "current_step_id_hint": current_step_id,
+            "descriptor_error_guidance": descriptor_error_guidance,
             "prompt": prompt,
             "raw_response": raw_response,
             "parsed_response": parsed,
