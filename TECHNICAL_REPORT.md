@@ -20,6 +20,34 @@ Supporting modules:
 - `src/routing.py`: text-only event reasoning, procedure state, event filtering, reasoner logs.
 - `src/smart_frame_sampler.py`: deterministic model-free frame sampling.
 
+## Run Command
+
+Set `OPENROUTER_API_KEY`, then run any clip by passing the matching procedure JSON, video file, and output paths:
+
+```bash
+export OPENROUTER_API_KEY="your_openrouter_key"
+
+.venv/bin/python src/run.py \
+  --procedure data/clip_procedures/<procedure_file>.json \
+  --video data/videos_full/<clip_folder>/Export_py/Video_pitchshift.mp4 \
+  --output output/<clip_name>-events.json \
+  --descriptor-log output/<clip_name>-descriptor.jsonl \
+  --reasoner-log output/<clip_name>-reasoner.jsonl \
+  --speed 1.0
+```
+
+Example:
+
+```bash
+.venv/bin/python src/run.py \
+  --procedure data/clip_procedures/z045-june-24-22-dslr.json \
+  --video data/videos_full/z045-june-24-22-dslr/Export_py/Video_pitchshift.mp4 \
+  --output output/z045-submission-events.json \
+  --descriptor-log output/z045-submission-descriptor.jsonl \
+  --reasoner-log output/z045-submission-reasoner.jsonl \
+  --speed 1.0
+```
+
 ## Frame Sampling
 
 The harness delivers frames at 2 FPS by default. The pipeline forms 5-second windows, usually 10 candidate frames. The default `smart` sampler keeps five frames: the first frame, a middle anchor frame, the last frame, one transition frame between the first and middle anchors, and one transition frame between the middle and last anchors. For each transition region, it scores candidate frames by SSIM distance from both neighboring anchors, with a small sharpness adjustment, and selects the frame with the highest combined score.
