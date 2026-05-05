@@ -1,10 +1,18 @@
 # Technical Report: Realtime VLM Procedure Detector
 
+## R&D Iterations
+
+This challenge was ambiguous enough that the final pipeline came from several R&D iterations rather than a single prompt. The first baseline was a direct visual VLM detector: every rolling frame window received the procedure, current step, previous visual context, and recent window summaries, then emitted step/error events directly. This produced useful scene descriptions, but one missed step could block the ordered state machine, and generic step text such as "turns on the circuit breaker box" or "inserts the RAM card" was not descriptive enough for reliable end-state timing.
+
+The next iteration added pre-generated per-step visual rubrics. These rubrics described likely start, during, end, and not-completion states for each procedure step. They helped the model understand what a step endpoint might look like; for example, a RAM insertion should not complete while the hand is still pressing the card, and a circuit-breaker step should require the target component rather than a toolbox/container. This made the reasoning traces more auditable and helped avoid some premature completions.
+
+However, rigid rubrics also exposed a core limitation: some mechanical states are hard to see from egocentric frames. RAM retaining clips can be hidden by fingers, camera on/off state may have no clear visual indicator, and "touch metal" can mean either first contact or the end of a sustained contact interval. Strict rubrics sometimes caused the model to wait for impossible visual evidence, while loose rubrics caused early detections. This led to the submitted descriptor/reasoner design: keep the image model focused on grounded description, then let a stronger text reasoner handle procedure state, catch-up, ambiguity, and error decisions over the accumulated descriptions.
+
 ## Architecture
 
 The submitted pipeline in `src/run.py` uses a two-stage descriptor/reasoner design on top of the provided `StreamingHarness`. The frame callback buffers frames into 5-second visual windows. Each window is sent to a lightweight image descriptor model, which outputs only grounded visual context: beginning state, ending state, motion/change, visible objects, scene layout, uncertainty, and step relevance. It is explicitly instructed not to emit events or decide correctness.
 
-Every two descriptor windows, a text-only reasoner model receives the descriptor text, procedure state, current step summary, and optional rubrics. The reasoner emits `step_completion` and `error_detected` events through `harness.emit_event`. It also maintains completed steps and a running per-step summary so later decisions can use recent visual history without repeatedly sending images to the larger model. This keeps image perception and procedure reasoning separate, which made failures easier to inspect in logs, and iterate from there.
+Every two descriptor windows, a text-only reasoner model receives the descriptor text, procedure state, current step summary, and optional rubrics. The reasoner emits `step_completion` and `error_detected` events through `harness.emit_event`. It also maintains completed steps and a running per-step summary so later decisions can use recent visual history without repeatedly sending images to the larger model. After each reasoning call, it can also send a small `descriptor_error_guidance` object back to the descriptor prompt so the next visual window pays attention to concrete error-prone details, while still leaving the final error decision to the reasoner. This keeps image perception and procedure reasoning separate, which made failures easier to inspect in logs, and iterate from there.
 
 Supporting modules:
 
@@ -49,6 +57,28 @@ I evaluated the integrated descriptor/reasoner approach on four training clips d
 | R066 Circuit Breaker | `output/R066-integrated-smart-metrics.json` | 0.455 | 5 / 11 | 0.000 | 0 / 6 |
 | R142 RAM | `output/R142-integrated-smart-metrics.json` | 0.154 | 2 / 13 | 0.000 | 0 / 0 |
 
+I also ran a submission-speed check at `--speed 1.0` on three clips to estimate the latency component of the challenge score. The formula used here is `latency_score = max(0, 1 - mean_detection_delay / 10)`.
+
+| Clip | Metrics File | Step F1 | Step TP / GT | Error F1 | Error TP / GT | Mean Delay | P90 Delay | Latency Score |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| R066 Circuit Breaker | `output/score_R066-metrics.json` | 0.727 | 8 / 11 | 0.000 | 0 / 6 | 175.903s | 263.122s | 0.000 |
+| R073 GoPro | `output/score_R073-metrics.json` | 0.400 | 4 / 11 | 0.000 | 0 / 0 | 185.539s | 321.160s | 0.000 |
+| R087 GoPro | `output/score_R087-metrics.json` | 0.500 | 1 / 2 | 0.000 | 0 / 20 | 43.019s | 63.991s | 0.000 |
+| R090 ATV | `output/score_R090-metrics.json` | 0.545 | 6 / 11 | 0.000 | 0 / 0 | 175.680s | 276.061s | 0.000 |
+| R092 Circuit Breaker | `output/score_R092-metrics.json` | 0.286 | 2 / 12 | 0.000 | 0 / 0 | 146.750s | 242.436s | 0.000 |
+| R142 RAM | `output/score_R142-metrics.json` | 0.231 | 3 / 13 | 0.000 | 0 / 0 | 206.321s | 339.134s | 0.000 |
+| R190 ATV | `output/score_R190-metrics.json` | 0.400 | 5 / 13 | 0.125 | 1 / 8 | 340.840s | 535.476s | 0.000 |
+| R192 Circuit Breaker | `output/score_R192-metrics.json` | 0.667 | 10 / 15 | 0.000 | 0 / 1 | 153.707s | 255.203s | 0.000 |
+| R198 Graphics Card | `output/score_R198-metrics.json` | 0.455 | 5 / 11 | 0.000 | 0 / 7 | 231.421s | 397.292s | 0.000 |
+| z010 GoPro | `output/score_z010-metrics.json` | 0.250 | 3 / 12 | 0.000 | 0 / 1 | 353.310s | 562.910s | 0.000 |
+| z039 DSLR | `output/score_z039-metrics.json` | 0.500 | 5 / 10 | 0.400 | 2 / 7 | 180.040s | 302.640s | 0.000 |
+| z045 DSLR | `output/score_z045-metrics.json` | 0.154 | 1 / 8 | 0.222 | 1 / 7 | 79.730s | 144.510s | 0.000 |
+| z065 DSLR | `output/score_z065-metrics.json` | 0.375 | 3 / 8 | 0.091 | 1 / 21 | 100.420s | 202.180s | 0.000 |
+| z067 GoPro | `output/score_z067-metrics.json` | 0.200 | 3 / 15 | 0.273 | 3 / 8 | 388.550s | 638.900s | 0.000 |
+| z108 GoPro | `output/score_z108-metrics.json` | 0.500 | 7 / 14 | 0.133 | 1 / 7 | 338.160s | 639.770s | 0.000 |
+
+These latency numbers are the main weakness of the current implementation. The algorithmic cadence is 5-second descriptor windows and 10-second reasoner intervals, but model calls are synchronous inside the harness callback, so API time accumulates as backlog during a real-time run.
+
 The main takeaway is that the two-stage routing architecture improves debuggability: descriptor logs show what the vision model perceived, and reasoner logs show why an event was or was not emitted. The remaining accuracy bottleneck is mostly visual ambiguity and over/under-claiming in descriptors, especially for mechanical states such as whether a RAM card is fully seated or whether a camera control action actually changed internal state.
 
 The headline F1 scores understate some useful behavior. With verbose timing inspection, several detections were semantically plausible but landed just outside the evaluator's ±5s tolerance window. Examples of near-miss step detections:
@@ -63,13 +93,22 @@ The headline F1 scores understate some useful behavior. With verbose timing insp
 | R142 RAM | 3 | 47.250s | 53.300s | -6.050s |
 | R142 RAM | 13 | 207.250s | 214.200s | -6.950s |
 
-These near misses suggest the system often identifies the right procedural phase, but timestamping is still coarse because of two reasons, firstly timestamps are assigned to event window midpoints, adding reference times to descriptor descriptions will improve this, secondly there are some steps in many of the videos that have ambiguities regarding their completion. For Ex: In the R066 video's step 1, the description mentions "The student grabs the circuit breaker." which would indicate step completion to be the moment the circuit breaker lands in the students hands, in the video this happens around the 42 second mark, but the GT marks that as step start and the step end is the last frame before the next step begins, which is not in line with the instructions as the step end is marked by the first moment the action is deemed completed/ended. There is a similar case in the z045 video where in step 4 the student is asked to touch the metal surface, the ground truth marks the step end to be when the contact with metal surface is broken, but it is not wrong to interpret such a step to end when the action of making contact with the metal surface is made. A logical way the VLM approaches this is, it reasons that because the step is to make contact with the metal surface, it asks the question have you made contact with the metal surface, if so then we are done with this step. The problem with such steps is they sort of gate and throw off the next steps, causing the VLM to either error out falsely or be off with it's timings.
+These near misses suggest the system often identifies the right procedural phase, but timestamping is still coarse. Events are currently assigned to descriptor-window midpoints, so an otherwise correct detection can miss the evaluator window by a few seconds. Some steps also have ambiguous completion semantics: the video may show the action becoming true before the ground truth marks the step as complete.
 
-## Next Step: Dynamic Descriptor Guidance
+## Dynamic Descriptor Guidance For Errors
 
-A concrete next improvement is to make the reasoner produce dynamic guidance for the next descriptor call. Today, the descriptor receives only previous/current/next step names as hints. The reasoner maintains richer state internally, but it does not yet tell the descriptor what visual evidence is missing or ambiguous.
+A separate problem was that generic visual descriptions often missed the exact details needed for error detection. For example, saying "the student manipulates the camera" is not enough to decide whether they used the lens cap or lens hood, and saying "the student manipulates the mount" is not enough to know whether a screw failed to seat or a wrong mount was used.
 
-The next version would have the reasoner output a small `descriptor_guidance` object after each reasoning call, for example: what objects to distinguish, what state transition to inspect, what not to overclaim, and what possible wrong action to watch for. For a RAM insertion step, this could tell the descriptor to focus on whether the card is still being pressed, whether the hand released it, whether clips appear engaged, and whether the student has moved on to another RAM card. For DSLR clips, it could ask the descriptor to distinguish lens cap, lens hood, lens body, camera switch, and battery/card compartments. This keeps the descriptor visual-only while making its descriptions more targeted to the current procedural uncertainty.
+To address this, the reasoner outputs `descriptor_error_guidance` after each reasoning call. This is not an error label. It is a visual-only focus list passed to the next descriptor call, asking it to report concrete possibilities such as wrong object/location, failed or repeated attempt, improper mechanical action, or unnecessary reversal. The descriptor still does not decide correctness; it only describes the relevant visual evidence in more detail. The reasoner remains the only component that emits `error_detected`.
+
+The four error categories are used as an internal guidance taxonomy, not as extra output labels. Final emitted errors still use the challenge schema values such as `wrong_action`, `safety_violation`, `improper_technique`, and `other`.
+
+Examples:
+
+- z039 DSLR: guidance encouraged the descriptor to distinguish lens cap, lens hood, lens body, camera controls, battery compartment, and SD-card compartment. Error detection improved from `2/7` matched in an earlier strong routing run to `5/7` matched in the guided run, although it also introduced extra false positives when procedure state drifted.
+- R066 Circuit Breaker: guidance asks the descriptor to distinguish the small red floor toolbox from the larger red `PRO STEEL` toolbox and to report whether the student is actually handling a circuit breaker or only a toolbox/container. This helps wrong-object reasoning, though the run remained sensitive to timing and state drift.
+- GoPro clips: guidance asks for details such as whether the SD card or mount screw is repeatedly pushed, released, seated, locked, dropped, or re-aligned. These repeated mechanical patterns are more useful for detecting failed attempts than a generic "the student manipulates the object" description.
+- R142 RAM: for hard mechanical states, guidance can ask the descriptor to report whether the hand is still pressing the RAM card, whether the hand releases it, whether clips appear engaged, and whether the student moves on to the next RAM card.
 
 ## Bidirectional Streaming Redesign
 
